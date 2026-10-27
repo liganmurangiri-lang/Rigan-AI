@@ -1,0 +1,23 @@
+import random
+
+print("=== AI YA DHARURA IMEWAKA ===")
+print("Habari! Mimi ni AI yako ya kwanza.")
+
+majibu = [
+    "Hiyo inafurahisha sana!",
+    "sawa, nimefahamu niambie zaidi",
+    "mimi ni AI tu, lakini nakuelewa",
+    "hilo! ni wazo nzuri sana.",
+    "kazi njema hendera kujifunza"
+]
+
+while True:
+    swali = input("\nWewe: ")
+    if swali.lower() == "toka":
+        print("AI: kwaheri! tutaonana")
+        break
+    
+    jibu_la_ai = random.choice(majibu)
+    print("AI: " + jibu_la_ai)
+
+
