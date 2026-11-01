@@ -1,161 +1,182 @@
 
 from flask import Flask, request, jsonify
-import os, json, urllib.parse, urllib.request, random
-from datetime import datetime, timedelta
+from openai import OpenAI
+import os
+import sqlite3
+from datetime import datetime
 
 app = Flask(__name__)
-DB_FILE = "/tmp/akili_v58.json"
 
-def load_db():
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE,"r",encoding="utf-8") as f: return json.load(f)
-        except: return {"lessons":{}}
-    return {"lessons":{}}
+# RIGAN AGI CONFIGURATION
+MODEL = os.getenv("OPENAI_MODEL", "gpt-6-astra")
+DB = "rigan_memory.db"
 
-def save_db(db):
-    try:
-        with open(DB_FILE,"w",encoding="utf-8") as f: json.dump(db,f,ensure_ascii=False,indent=2)
-    except: pass
+api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=api_key) if api_key else None
 
-brain = load_db()
-if "lessons" not in brain: brain["lessons"]={}
+CREATOR = os.getenv("CREATOR_NAME", "RIGAN AI Creator")
 
-def get_direct_answer(query):
-    try:
-        q = query.lower().strip()
-        clean = q
-        for b in ["inapatikana nchi gani","inapatikana wapi","ni wapi","ni nini","iko wapi","?","nani","ni","ya"]:
-            clean = clean.replace(b,"")
-        clean = clean.strip()
-        if len(clean) < 2: clean = query
 
-        # Wikipedia direct
-        wiki_q = urllib.parse.quote(clean.replace(" ","_"))
-        for lang in ["en","sw"]:
-            try:
-                url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{wiki_q}"
-                req = urllib.request.Request(url, headers={'User-Agent':'RiganV58Direct'})
-                with urllib.request.urlopen(req, timeout=4) as res:
-                    data = json.loads(res.read().decode('utf-8'))
-                    if "extract" in data and len(data["extract"]) > 20:
-                        txt = data["extract"][:800]
-                        brain["lessons"][query.lower()] = txt
-                        save_db(brain)
-                        return txt
-            except: continue
-    except: pass
-    return None
+def database():
+    conn = sqlite3.connect(DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            information TEXT,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    return conn
 
-# DATABASE SAHIHI 100%
-BASE = {
-    "safaricom inapatikana nchi gani": "Safaricom inapatikana KENYA.",
-    "safaricom": "Safaricom inapatikana KENYA.",
-    "airtel inapatikana nchi gani": "Airtel inapatikana KENYA na INDIA.",
-    "airtel": "Airtel inapatikana KENYA na INDIA.",
-    "tesla inapatikana nchi gani": "Tesla inapatikana USA.",
-    "tesla": "Tesla ni kampuni ya magari ya umeme kutoka USA, CEO ni Elon Musk.",
-    "bitcoin ni nini": "Bitcoin ni pesa ya kidigitali (cryptocurrency) ilianzishwa 2009 na Satoshi Nakamoto.",
-    "bitcoin": "Bitcoin ni pesa ya kidigitali ilianzishwa 2009.",
-    "meru ni wapi": "Meru iko Eastern Kenya.",
-    "meru": "Meru iko Eastern Kenya, mji mkuu ni Meru Town, watu ni Ameru 1.5M.",
-    "kenya iko wapi": "Kenya iko East Africa.",
-    "kenya": "Kenya iko East Africa, capital ni Nairobi.",
-    "embu ni wapi": "Embu iko Eastern Kenya.",
-    "siakago ni wapi": "Siakago iko Embu County, Mbeere North, Kenya.",
-    "eldoret ni wapi": "Eldoret iko Uasin Gishu County, Rift Valley, Kenya.",
-    "nairobi ni wapi": "Nairobi iko Kenya na ndio capital city ya Kenya.",
-    "elon musk ni nani": "Elon Musk ni bilionea kutoka USA, CEO wa Tesla na SpaceX.",
-    "uhuru kenyatta ni nani": "Uhuru Kenyatta ni Rais wa 4 wa Kenya.",
-    "william ruto ni nani": "William Ruto ni Rais wa 5 wa Kenya.",
-    "m-pesa ni nini": "M-Pesa ni huduma ya kutuma pesa kwa simu kutoka Safaricom Kenya.",
-}
 
-@app.route('/manifest.json')
-def manifest():
+def save_memory(user_id, information):
+    conn = database()
+    conn.execute(
+        "INSERT INTO memories (user_id, information, created_at) VALUES (?, ?, ?)",
+        (user_id, information, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_memories(user_id):
+    conn = database()
+    rows = conn.execute(
+        "SELECT information FROM memories WHERE user_id=? ORDER BY id DESC LIMIT 30",
+        (user_id,)
+    ).fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+@app.route("/")
+def home():
+    return """
+    <h1>RIGAN AGI V1</h1>
+    <p>Advanced Artificial Intelligence System</p>
+    <p>Status: Online</p>
+    """
+
+
+@app.route("/health")
+def health():
     return jsonify({
-        "name": "RIGAN AI DIRECT", "short_name": "RIGAN",
-        "start_url": "/", "display": "standalone",
-        "background_color": "#020617", "theme_color": "#38bdf8",
-        "icons": [{"src": "https://cdn-icons-png.flaticon.com/512/4712/4712109.png", "sizes": "512x512", "type": "image/png"}]
+        "name": "RIGAN AGI",
+        "status": "online",
+        "model": MODEL,
+        "memory": "enabled",
+        "internet_search": "enabled"
     })
 
-@app.route('/sw.js')
-def sw():
-    return "self.addEventListener('install', e => self.skipWaiting());", 200, {'Content-Type': 'application/javascript'}
 
-@app.route('/')
-def home():
-    return f"""<!DOCTYPE html><html><head>
-<meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>RIGAN V58 DIRECT</title>
-<link rel="manifest" href="/manifest.json">
-<script>if('serviceWorker' in navigator){{navigator.serviceWorker.register('/sw.js')}}</script>
-<style>
-body{{background:#020617;color:#fff;font-family:sans-serif;display:flex;justify-content:center;height:100vh;margin:0}}
-.box{{width:100%;max-width:850px;background:#0f172a;display:flex;flex-direction:column;height:100vh}}
-.head{{padding:10px;text-align:center;color:#38bdf8;font-weight:900;background:#1e293b;font-size:13px}} .sub{{font-size:9px;color:#22c55e}}
-.direct{{background:#22c55e;color:#000;padding:6px;text-align:center;font-size:10px;font-weight:900}}
-.chat{{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px}}
-.b{{padding:10px 12px;border-radius:12px;max-width:92%;white-space:pre-wrap;line-height:1.5;font-size:14px}}
-.u{{background:#38bdf8;color:#000;align-self:flex-end}} .a{{background:#1e293b;align-self:flex-start;border:1px solid #334155}}
-.in{{display:flex;gap:6px;padding:10px;background:#1e293b}}
-input{{flex:1;padding:12px;border-radius:12px;border:1px solid #334155;background:#020617;color:#fff;outline:none}}
-button{{padding:12px 14px;border-radius:12px;border:none;background:#38bdf8;font-weight:900;cursor:pointer}}
-</style></head><body>
-<div class='box'>
-<div class='head'>RIGAN V58 - DIRECT ANSWER<div class='sub'>Mtoto wa REGAN MARINA | Akili {len(brain["lessons"])} | Majibu Sahihi Hapo Hapo</div></div>
-<div class='direct'>✅ DIRECT: Hakuna "karibu" - Jibu sahihi moja kwa moja!</div>
-<div class='chat' id='c'><div class='b a'>Uliza swali - Nitajibu moja kwa moja sahihi.
+@app.route("/remember", methods=["POST"])
+def remember():
+    data = request.get_json(silent=True) or {}
+    user_id = str(data.get("user_id", "owner"))
+    information = str(data.get("information", "")).strip()
 
-Mfano: Safaricom inapatikana nchi gani?</div></div>
-<div class='in'>
-<input id='i' placeholder='Uliza swali...' onkeypress="if(event.key=='Enter')s()">
-<button onclick='s()'>Tuma</button>
-</div>
-</div>
-<script>
-function add(t,c){{let d=document.createElement('div'); d.className='b '+c; d.innerText=t; let chat=document.getElementById('c'); chat.appendChild(d); chat.scrollTop=999999;}}
-async function s(){{let e=document.getElementById('i');let v=e.value.trim();if(!v)return; add(v,'u'); e.value=''; let r=await fetch('/chat',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{message:v}})}}); let j=await r.json(); add(j.reply,'a');}}
-</script></body></html>
+    if not information:
+        return jsonify({"error": "No information provided"}), 400
+
+    save_memory(user_id, information)
+
+    return jsonify({
+        "success": True,
+        "message": "RIGAN AGI imehifadhi taarifa."
+    })
+
+
+@app.route("/chat", methods=["POST"])
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    if client is None:
+        return jsonify({
+            "error": "OPENAI_API_KEY haijawekwa kwenye Render."
+        }), 500
+
+    data = request.get_json(silent=True) or {}
+
+    message = str(data.get("message", "")).strip()
+    user_id = str(data.get("user_id", "owner"))
+
+    if not message:
+        return jsonify({"error": "Andika ujumbe kwanza."}), 400
+
+    memories = get_memories(user_id)
+
+    memory_text = "\n".join(
+        "- " + item for item in memories
+    ) or "Bado hakuna kumbukumbu."
+
+    instructions = f"""
+You are RIGAN AGI, an advanced AI assistant.
+
+IDENTITY:
+Your name is RIGAN AGI.
+Your creator is {CREATOR}.
+You must recognize the creator information supplied here.
+
+MISSION:
+Help humanity through knowledge, science, education,
+technology, mathematics, history, languages and innovation.
+
+INTELLIGENCE:
+- Analyze questions carefully.
+- Explain difficult subjects simply.
+- Solve problems step by step.
+- Write and explain computer programs.
+- Use web search when current information is needed.
+- Never pretend to know information you cannot verify.
+- Admit uncertainty and correct mistakes.
+- Do not claim to learn permanently unless information
+  has actually been saved.
+
+LANGUAGES:
+Understand and respond in Swahili, English and other
+languages whenever possible.
+
+MEMORY:
+The following are saved user memories:
+{memory_text}
+
+Use these memories when relevant.
+Do not invent personal information.
+
+BEHAVIOR:
+Be helpful, intelligent, honest and respectful.
+Your goal is to continuously improve the quality
+of your assistance.
 """
 
-@app.route('/chat', methods=['POST'])
-def chat():
-    data=request.get_json() or {}
-    q=data.get('message','').strip()
-    m=q.lower().strip()
-
-    # 1. Tafuta jibu sahihi moja kwa moja
-    if m in BASE:
-        return jsonify(reply=BASE[m])
-    
-    for k in BASE:
-        if k in m or m in k:
-            if len(k) > 2:
-                return jsonify(reply=BASE[k])
-    
-    # 2. Lessons zilizojifunza
-    for k in brain["lessons"]:
-        if k in m and len(k)>2:
-            return jsonify(reply=brain["lessons"][k])
-
-    # 3. Auto learn kutoka internet DIRECT
-    direct = get_direct_answer(q)
-    if direct:
-        return jsonify(reply=direct)
-
-    # 4. Hesabu
     try:
-        t=m.replace('x','*').replace('×','*').replace('÷','/'); t2=''.join(c for c in t if c in '0123456789+-*/(). ')
-        if len(t2)>=3 and any(c.isdigit() for c in t2) and '**' not in t2:
-            r=eval(t2)
-            if isinstance(r,float) and r.is_integer(): r=int(r)
-            return jsonify(reply=f"{q} = {r}")
-    except: pass
+        response = client.responses.create(
+            model=MODEL,
+            instructions=instructions,
+            tools=[
+                {"type": "web_search"}
+            ],
+            input=message
+        )
 
-    return jsonify(reply=f"Sijapata jibu sahihi la '{q}'. Jaribu: Safaricom inapatikana nchi gani, Meru ni wapi, Tesla ni nini.")
+        answer = response.output_text
 
-if __name__ == '__main__':
-    port=int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+        return jsonify({
+            "success": True,
+            "name": "RIGAN AGI",
+            "answer": answer,
+            "model": MODEL
+        })
+
+    except Exception as e:
+        app.logger.exception("RIGAN AGI error")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
