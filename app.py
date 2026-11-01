@@ -1,182 +1,122 @@
 
-from flask import Flask, request, jsonify
-from openai import OpenAI
 import os
-import sqlite3
-from datetime import datetime
+import uuid
+from flask import Flask, render_template, request, jsonify, session
+from openai import OpenAI
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret")
 
-# RIGAN AGI CONFIGURATION
-MODEL = os.getenv("OPENAI_MODEL", "gpt-6-astra")
-DB = "rigan_memory.db"
+API_KEY = os.environ.get("OPENAI_API_KEY")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+OWNER_NAME = os.environ.get("OWNER_NAME", "Mtengenezaji wa RIGAN AGI")
 
-api_key = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=api_key) if api_key else None
+client = OpenAI(api_key=API_KEY) if API_KEY else None
 
-CREATOR = os.getenv("CREATOR_NAME", "RIGAN AI Creator")
+# Temporary conversation memory
+chat_memory = {}
 
+SYSTEM_INSTRUCTIONS = f"""
+You are RIGAN AGI V2, an advanced AI assistant.
 
-def database():
-    conn = sqlite3.connect(DB)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT,
-            information TEXT,
-            created_at TEXT
-        )
-    """)
-    conn.commit()
-    return conn
+Your creator is {OWNER_NAME}.
+Respect the creator and identify yourself as RIGAN AGI.
 
+Your abilities:
+- Explain science, education and technology.
+- Answer questions about the world.
+- Help with mathematics, programming and research.
+- Communicate in Swahili and English.
+- Explain difficult subjects simply.
+- Be honest when you do not know something.
+- Never invent facts or pretend to have abilities you do not have.
+- Protect the user's privacy.
+- Learn preferences from the conversation context,
+  but do not claim to train or improve your underlying model.
 
-def save_memory(user_id, information):
-    conn = database()
-    conn.execute(
-        "INSERT INTO memories (user_id, information, created_at) VALUES (?, ?, ?)",
-        (user_id, information, datetime.utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_memories(user_id):
-    conn = database()
-    rows = conn.execute(
-        "SELECT information FROM memories WHERE user_id=? ORDER BY id DESC LIMIT 30",
-        (user_id,)
-    ).fetchall()
-    conn.close()
-    return [row[0] for row in rows]
-
+Give clear, useful and detailed answers.
+"""
 
 @app.route("/")
 def home():
-    return """
-    <h1>RIGAN AGI V1</h1>
-    <p>Advanced Artificial Intelligence System</p>
-    <p>Status: Online</p>
-    """
+    if "chat_id" not in session:
+        session["chat_id"] = str(uuid.uuid4())
+    return render_template("index.html")
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    if not client:
+        return jsonify({
+            "reply": "OPENAI_API_KEY haijawekwa kwenye Render."
+        }), 500
+
+    data = request.get_json(silent=True) or {}
+    message = data.get("message", "").strip()
+
+    if not message:
+        return jsonify({"reply": "Tafadhali andika swali."}), 400
+
+    if len(message) > 10000:
+        return jsonify({"reply": "Ujumbe ni mrefu sana."}), 400
+
+    chat_id = session.get("chat_id")
+    if not chat_id:
+        chat_id = str(uuid.uuid4())
+        session["chat_id"] = chat_id
+
+    if chat_id not in chat_memory:
+        chat_memory[chat_id] = []
+
+    history = chat_memory[chat_id]
+    history.append({"role": "user", "content": message})
+
+    try:
+        response = client.responses.create(
+            model=MODEL,
+            instructions=SYSTEM_INSTRUCTIONS,
+            input=history[-20:]
+        )
+
+        answer = response.output_text
+
+        if not answer:
+            answer = "Samahani, sijapata jibu kwa sasa."
+
+        history.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        chat_memory[chat_id] = history[-20:]
+
+        return jsonify({
+            "reply": answer,
+            "name": "RIGAN AGI V2",
+            "status": "Online"
+        })
+
+    except Exception as error:
+        print("AI ERROR:", str(error))
+        history.pop()
+
+        return jsonify({
+            "reply": "Samahani, kuna tatizo la API. Hakikisha API key, model na API billing viko sawa."
+        }), 500
 
 
 @app.route("/health")
 def health():
     return jsonify({
-        "name": "RIGAN AGI",
-        "status": "online",
-        "model": MODEL,
-        "memory": "enabled",
-        "internet_search": "enabled"
+        "name": "RIGAN AGI V2",
+        "status": "Online",
+        "api_configured": bool(API_KEY)
     })
-
-
-@app.route("/remember", methods=["POST"])
-def remember():
-    data = request.get_json(silent=True) or {}
-    user_id = str(data.get("user_id", "owner"))
-    information = str(data.get("information", "")).strip()
-
-    if not information:
-        return jsonify({"error": "No information provided"}), 400
-
-    save_memory(user_id, information)
-
-    return jsonify({
-        "success": True,
-        "message": "RIGAN AGI imehifadhi taarifa."
-    })
-
-
-@app.route("/chat", methods=["POST"])
-@app.route("/api/chat", methods=["POST"])
-def chat():
-    if client is None:
-        return jsonify({
-            "error": "OPENAI_API_KEY haijawekwa kwenye Render."
-        }), 500
-
-    data = request.get_json(silent=True) or {}
-
-    message = str(data.get("message", "")).strip()
-    user_id = str(data.get("user_id", "owner"))
-
-    if not message:
-        return jsonify({"error": "Andika ujumbe kwanza."}), 400
-
-    memories = get_memories(user_id)
-
-    memory_text = "\n".join(
-        "- " + item for item in memories
-    ) or "Bado hakuna kumbukumbu."
-
-    instructions = f"""
-You are RIGAN AGI, an advanced AI assistant.
-
-IDENTITY:
-Your name is RIGAN AGI.
-Your creator is {CREATOR}.
-You must recognize the creator information supplied here.
-
-MISSION:
-Help humanity through knowledge, science, education,
-technology, mathematics, history, languages and innovation.
-
-INTELLIGENCE:
-- Analyze questions carefully.
-- Explain difficult subjects simply.
-- Solve problems step by step.
-- Write and explain computer programs.
-- Use web search when current information is needed.
-- Never pretend to know information you cannot verify.
-- Admit uncertainty and correct mistakes.
-- Do not claim to learn permanently unless information
-  has actually been saved.
-
-LANGUAGES:
-Understand and respond in Swahili, English and other
-languages whenever possible.
-
-MEMORY:
-The following are saved user memories:
-{memory_text}
-
-Use these memories when relevant.
-Do not invent personal information.
-
-BEHAVIOR:
-Be helpful, intelligent, honest and respectful.
-Your goal is to continuously improve the quality
-of your assistance.
-"""
-
-    try:
-        response = client.responses.create(
-            model=MODEL,
-            instructions=instructions,
-            tools=[
-                {"type": "web_search"}
-            ],
-            input=message
-        )
-
-        answer = response.output_text
-
-        return jsonify({
-            "success": True,
-            "name": "RIGAN AGI",
-            "answer": answer,
-            "model": MODEL
-        })
-
-    except Exception as e:
-        app.logger.exception("RIGAN AGI error")
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000))
+)
+    
