@@ -5,26 +5,19 @@ import base64
 from datetime import datetime, timezone
 
 import requests
-from flask import (
-    Flask, request, jsonify, session,
-    render_template_string
-)
-from sqlalchemy import (
-    create_engine, Column, String, Text,
-    DateTime, Integer
-)
+from flask import Flask, request, jsonify, session, render_template_string
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
-from openai import OpenAI
 
-# ==========================================
-# RIGAN AGI V16 ULTIMATE
-# ==========================================
+
+# ---------------- CONFIGURATION ----------------
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY")
 
-if not app.secret_key:
-    raise RuntimeError("SECRET_KEY haijawekwa Render.")
+app.secret_key = os.environ.get(
+    "SECRET_KEY",
+    "rigan-stable-session-key-change-this"
+)
 
 OWNER_NAME = os.environ.get("OWNER_NAME", "RIGAN Creator")
 
@@ -41,21 +34,18 @@ MODEL = os.environ.get(
 
 VISION_MODEL = os.environ.get(
     "VISION_MODEL",
-    "openai/gpt-4o-mini"
+    MODEL
 )
 
 IMAGE_MODEL = os.environ.get(
     "IMAGE_MODEL",
-    "google/gemini-2.5-flash-image"
+    "openai/gpt-5-image"
 )
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-if not API_KEY:
-    raise RuntimeError("OPENROUTER_API_KEY haijawekwa.")
-
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL haijawekwa.")
+    raise RuntimeError("DATABASE_URL haijawekwa kwenye Render.")
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace(
@@ -64,25 +54,23 @@ if DATABASE_URL.startswith("postgres://"):
 
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,
-    pool_recycle=300
+    pool_pre_ping=True
 )
 
 Base = declarative_base()
 DBSession = sessionmaker(bind=engine)
 
 
-# ==========================================
-# DATABASE - PRESERVE V15 MEMORY
-# ==========================================
+# ---------------- DATABASE ----------------
+# Majina na columns hizi zinahifadhi muundo wa V15.
 
 class Memory(Base):
     __tablename__ = "rigan_memory"
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(String(100), index=True)
-    role = Column(String(20))
-    content = Column(Text)
+    user_id = Column(String(100), nullable=False, index=True)
+    role = Column(String(30), nullable=False)
+    content = Column(Text, nullable=False)
     created_at = Column(
         DateTime,
         default=lambda: datetime.now(timezone.utc)
@@ -93,8 +81,8 @@ class Knowledge(Base):
     __tablename__ = "rigan_knowledge"
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(String(100), index=True)
-    content = Column(Text)
+    user_id = Column(String(100), nullable=False, index=True)
+    content = Column(Text, nullable=False)
     created_at = Column(
         DateTime,
         default=lambda: datetime.now(timezone.utc)
@@ -104,793 +92,652 @@ class Knowledge(Base):
 Base.metadata.create_all(engine)
 
 
-# ==========================================
-# OPENROUTER CONNECTION
-# ==========================================
-
-client = OpenAI(
-    api_key=API_KEY,
-    base_url="https://openrouter.ai/api/v1",
-    default_headers={
-        "HTTP-Referer": os.environ.get(
-            "APP_URL", "https://riganai.onrender.com"
-        ),
-        "X-Title": "RIGAN AGI V16 ULTIMATE"
-    }
-)
-
-API_URL = "https://openrouter.ai/api/v1"
-
-
-def api_headers():
-    return {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-
-# ==========================================
-# USER ID AND MEMORY
-# ==========================================
-
 def get_user_id():
-    if "user_id" not in session:
-        session["user_id"] = str(uuid.uuid4())
-    return session["user_id"]
+    if "rigan_user_id" not in session:
+        session["rigan_user_id"] = str(uuid.uuid4())
+    return session["rigan_user_id"]
 
 
-def save_memory(user_id, role, content):
+def save_memory(role, content):
     db = DBSession()
     try:
-        db.add(Memory(
-            user_id=user_id,
+        item = Memory(
+            user_id=get_user_id(),
             role=role,
-            content=str(content)[:12000]
-        ))
+            content=str(content)
+        )
+        db.add(item)
         db.commit()
     finally:
         db.close()
 
 
-def get_history(user_id, limit=15):
+def get_history(limit=16):
     db = DBSession()
     try:
         rows = (
             db.query(Memory)
-            .filter_by(user_id=user_id)
+            .filter(Memory.user_id == get_user_id())
             .order_by(Memory.id.desc())
             .limit(limit)
             .all()
         )
+        rows.reverse()
 
         return [
             {"role": row.role, "content": row.content}
-            for row in reversed(rows)
+            for row in rows
         ]
     finally:
         db.close()
 
 
-def save_knowledge(user_id, content):
+def save_knowledge(content):
     db = DBSession()
     try:
-        db.add(Knowledge(
-            user_id=user_id,
-            content=content[:10000]
-        ))
+        item = Knowledge(
+            user_id=get_user_id(),
+            content=content
+        )
+        db.add(item)
         db.commit()
     finally:
         db.close()
 
 
-def get_knowledge(user_id):
+def get_knowledge(limit=20):
     db = DBSession()
     try:
         rows = (
             db.query(Knowledge)
-            .filter_by(user_id=user_id)
+            .filter(Knowledge.user_id == get_user_id())
             .order_by(Knowledge.id.desc())
-            .limit(40)
+            .limit(limit)
             .all()
         )
-        return [r.content for r in reversed(rows)]
+        return [row.content for row in rows]
     finally:
         db.close()
 
 
-# ==========================================
-# INTELLIGENCE AND PERSONALITY
-# ==========================================
+# ---------------- OPENROUTER ----------------
 
-def system_prompt(user_id):
-    facts = get_knowledge(user_id)
+def api_headers():
+    if not API_KEY:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY haijawekwa kwenye Render."
+        )
 
-    saved_facts = "\n".join(
-        "- " + item for item in facts
-    ) or "Hakuna maarifa mapya yaliyohifadhiwa."
+    return {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.environ.get(
+            "APP_URL", "https://riganai.onrender.com"
+        ),
+        "X-Title": "RIGAN AGI"
+    }
+
+
+def system_prompt():
+    knowledge = get_knowledge()
+
+    knowledge_text = "\n".join(
+        f"- {item}" for item in knowledge
+    )
 
     return f"""
-You are RIGAN AGI V16 ULTIMATE.
+You are RIGAN AGI, an intelligent AI assistant.
 
-CREATOR:
 Your creator and owner is {OWNER_NAME}.
+When asked who created you, explain that {OWNER_NAME} is your creator.
 
-IDENTITY:
-- Your name is RIGAN AGI V16.
-- You are a helpful personal AI assistant.
-- Respect your creator.
-- Communicate in Swahili, English and other languages.
-- Understand the user's language and reply in that language.
+You communicate fluently in Kiswahili and English.
+Reply in the language used by the user.
 
-INTELLIGENCE:
-You help with:
-Science, education, technology, mathematics,
-history, geography, programming, AI and world knowledge.
+Help with science, education, technology, mathematics,
+history, programming, business and general knowledge.
 
-INTERNET:
-When web search is available, use current sources
-for questions about recent events and changing facts.
-Clearly distinguish sourced information from your own explanation.
-Never invent sources or links.
+Be honest. Never invent facts or claim you performed
+an action that you did not perform.
 
-LEARNING:
-- Use saved knowledge when relevant.
-- Do not claim to remember facts that are not saved.
-- You may learn new facts when the user explicitly requests it.
-- Never claim to modify your own program or weights.
-- Do not invent information.
+Use saved knowledge when relevant, but do not treat
+unverified user statements as guaranteed facts.
 
-VISION:
-When an image is provided, examine it carefully.
-Describe visible details and answer questions about it.
-Do not pretend to see an image if none was provided.
-
-CREATOR RECOGNITION:
-The configured owner is {OWNER_NAME}.
-Do not reveal private information or passwords.
+You can remember saved conversations and facts.
+You do not retrain your underlying AI model by yourself.
 
 SAVED KNOWLEDGE:
-{saved_facts}
-
-BEHAVIOUR:
-- Be intelligent, clear and helpful.
-- Explain difficult subjects simply.
-- Admit uncertainty.
-- Never fabricate facts.
+{knowledge_text}
 """
 
 
-# ==========================================
-# CHAT ENGINE
-# ==========================================
-
-def ask_rigan(user_message, use_web=False):
-    user_id = get_user_id()
-    message = user_message.strip()
-
-    if not message or len(message) > 12000:
-        return "Tafadhali tuma ujumbe wenye urefu unaofaa."
-
-    # Explicit learning
-    lower = message.lower()
-
-    if lower.startswith(("jifunze:", "learn:")):
-        fact = message.split(":", 1)[1].strip()
-
-        if not fact:
-            return "Andika taarifa unayotaka nijifunze."
-
-        save_knowledge(user_id, fact)
-
-        answer = (
-            "Nimehifadhi taarifa hii kwenye PostgreSQL. "
-            "Nitaiweza kuitumia katika mazungumzo yajayo."
-        )
-
-        save_memory(user_id, "user", message)
-        save_memory(user_id, "assistant", answer)
-        return answer
-
-    history = get_history(user_id)
+def ask_rigan(message):
+    history = get_history()
 
     messages = [
-        {
-            "role": "system",
-            "content": system_prompt(user_id)
-        }
+        {"role": "system", "content": system_prompt()}
     ]
 
     messages.extend(history)
-
     messages.append({
         "role": "user",
         "content": message
     })
 
-    extra = {}
-
-    # Web search is optional and user-controlled.
-    if use_web:
-        extra["plugins"] = [
-            {"id": "web", "max_results": 5}
-        ]
-
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        temperature=0.7,
-        max_tokens=2000,
-        extra_body=extra if extra else None
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=api_headers(),
+        json={
+            "model": MODEL,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 1800
+        },
+        timeout=90
     )
 
-    answer = response.choices[0].message.content
+    if not response.ok:
+        raise RuntimeError(
+            f"OpenRouter chat error {response.status_code}: "
+            f"{response.text[:900]}"
+        )
+
+    data = response.json()
+    answer = data["choices"][0]["message"]["content"]
+
+    if isinstance(answer, list):
+        answer = "\n".join(
+            part.get("text", "")
+            for part in answer
+            if isinstance(part, dict)
+        )
 
     if not answer:
-        answer = "Samahani, sijapata jibu."
+        raise RuntimeError("AI haijarudisha jibu.")
 
-    save_memory(user_id, "user", message)
-    save_memory(user_id, "assistant", answer)
+    save_memory("user", message)
+    save_memory("assistant", answer)
 
     return answer
 
 
-# ==========================================
-# IMAGE UNDERSTANDING
-# ==========================================
+# ---------------- IMAGE UNDERSTANDING ----------------
 
-def understand_image(user_message, image_data):
-    user_id = get_user_id()
+def understand_image(image_data, mime_type, question):
+    if not API_KEY:
+        raise RuntimeError("OpenRouter API key haijawekwa.")
 
-    if not image_data.startswith("data:image/"):
-        raise ValueError("Picha haijatambuliwa.")
+    data_url = (
+        f"data:{mime_type};base64,{image_data}"
+    )
 
-    if len(image_data) > 5 * 1024 * 1024:
-        raise ValueError("Picha ni kubwa sana. Tumia picha ndogo.")
-
-    content = [
-        {
-            "type": "text",
-            "text": user_message or "Eleza picha hii kwa undani."
-        },
-        {
-            "type": "image_url",
-            "image_url": {
-                "url": image_data
-            }
-        }
-    ]
-
-    response = client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[
+    payload = {
+        "model": VISION_MODEL,
+        "messages": [
             {
                 "role": "system",
-                "content": system_prompt(user_id)
+                "content": system_prompt()
             },
             {
                 "role": "user",
-                "content": content
+                "content": [
+                    {
+                        "type": "text",
+                        "text": question or
+                        ""Eleza picha hii kwa Kiswahili.""
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_url
+                        }
+                    }
+                ]
             }
         ],
-        max_tokens=1800
+        "max_tokens": 1500
+    }
+
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=api_headers(),
+        json=payload,
+        timeout=120
     )
 
-    answer = response.choices[0].message.content
+    if not response.ok:
+        raise RuntimeError(
+            f"Vision error {response.status_code}: "
+            f"{response.text[:900]}"
+        )
 
-    if not answer:
-        answer = "Sijaweza kuchambua picha."
+    answer = response.json()["choices"][0]["message"]["content"]
 
-    save_memory(
-        user_id,
-        "user",
-        "[Picha] " + (user_message or "Chambua picha")
-    )
+    if isinstance(answer, list):
+        answer = "\n".join(
+            part.get("text", "")
+            for part in answer
+            if isinstance(part, dict)
+        )
 
-    save_memory(user_id, "assistant", answer)
+    save_memory("user", "[Picha] " + (question or "Eleza picha"))
+    save_memory("assistant", answer)
 
     return answer
 
 
-# ==========================================
-# IMAGE GENERATION
-# ==========================================
+# ---------------- IMAGE GENERATION ----------------
 
 def generate_image(prompt):
-    if not prompt or len(prompt) > 3000:
-        raise ValueError("Maelekezo ya picha si sahihi.")
-
     response = requests.post(
-        API_URL + "/images",
+        "https://openrouter.ai/api/v1/images",
         headers=api_headers(),
         json={
             "model": IMAGE_MODEL,
-            "prompt": prompt
+            "prompt": prompt,
+            "n": 1,
+            "size": "1024x1024"
         },
         timeout=180
     )
 
     if not response.ok:
         raise RuntimeError(
-            f"Image API error {response.status_code}: "
-            + response.text[:1200]
+            f"Image error {response.status_code}: "
+            f"{response.text[:900]}"
         )
 
-    result = response.json()
-    images = result.get("data") or []
+    data = response.json()
+    images = data.get("data", [])
 
     if not images or not images[0].get("b64_json"):
-        raise RuntimeError("API haikurudisha picha.")
+        raise RuntimeError(
+            "Hakuna picha iliyorejeshwa. "
+            "Angalia kama IMAGE_MODEL inaunga mkono Images API."
+        )
 
-    image = images[0]
+    mime = images[0].get("media_type", "image/png")
+    encoded = images[0]["b64_json"]
 
-    media_type = image.get("media_type", "image/png")
-    if media_type not in ("image/png", "image/jpeg", "image/webp"):
-        media_type = "image/png"
-
-    return "data:" + media_type + ";base64," + image["b64_json"]
+    return f"data:{mime};base64,{encoded}"
 
 
-# ==========================================
-# WEBSITE INTERFACE
-# ==========================================
+# ---------------- WEB PAGE ----------------
 
-HTML = r"""
+PAGE = """
 <!DOCTYPE html>
-<html lang="sw">
+<html>
 <head>
-<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-
-<title>RIGAN AGI V16 ULTIMATE</title>
-
+<title>RIGAN AGI V16</title>
 <style>
-* {box-sizing:border-box}
-
 body {
-    background:#0b1120;
-    color:white;
-    font-family:Arial,sans-serif;
-    margin:0;
-    padding:12px;
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #101827;
+    color: white;
 }
-
-.container {
-    max-width:850px;
-    margin:auto;
+header {
+    background: #17263c;
+    padding: 17px;
+    text-align: center;
+    font-size: 22px;
+    font-weight: bold;
 }
-
-h1 {
-    text-align:center;
-    color:#38bdf8;
-    margin-bottom:5px;
+main {
+    max-width: 850px;
+    margin: auto;
+    padding: 15px;
 }
-
-.subtitle {
-    text-align:center;
-    color:#94a3b8;
-}
-
 #chat {
-    background:#172033;
-    border:1px solid #334155;
-    border-radius:14px;
-    height:53vh;
-    min-height:300px;
-    overflow-y:auto;
-    padding:12px;
-    margin-top:15px;
+    min-height: 55vh;
+    max-height: 65vh;
+    overflow-y: auto;
+    background: #172235;
+    border-radius: 12px;
+    padding: 12px;
 }
-
-.message {
-    padding:12px;
-    margin:10px 0;
-    border-radius:12px;
-    white-space:pre-wrap;
-    overflow-wrap:anywhere;
-    line-height:1.5;
+.msg {
+    padding: 12px;
+    margin: 10px 0;
+    border-radius: 10px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
 }
-
-.user {background:#075985}
-.ai {background:#334155}
-
-.message img {
-    max-width:100%;
-    border-radius:10px;
-    margin-top:10px;
+.user { background: #174c76; }
+.bot { background: #26354a; }
+img.result {
+    width: 100%;
+    max-width: 500px;
+    display: block;
+    margin-top: 10px;
+    border-radius: 12px;
 }
-
 textarea {
-    width:100%;
-    height:75px;
-    border:0;
-    border-radius:10px;
-    padding:13px;
-    font-size:16px;
-    margin-top:12px;
-    background:#e2e8f0;
-    color:#111827;
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 75px;
+    margin-top: 12px;
+    padding: 12px;
+    border-radius: 10px;
+    font-size: 16px;
 }
-
-button {
-    border:0;
-    border-radius:9px;
-    padding:12px;
-    margin:4px 2px;
-    background:#0284c7;
-    color:white;
-    font-size:14px;
-    cursor:pointer;
+button, .upload {
+    background: #1676c5;
+    color: white;
+    border: 0;
+    padding: 12px;
+    border-radius: 9px;
+    margin: 5px 2px;
+    font-size: 15px;
 }
-
-button:disabled {opacity:.5}
-
-.tools {
-    display:flex;
-    flex-wrap:wrap;
-    gap:5px;
-    margin-top:8px;
-}
-
-.tools button {flex:1}
-
-.options {
-    display:flex;
-    gap:12px;
-    flex-wrap:wrap;
-    margin-top:10px;
-    color:#cbd5e1;
-    font-size:13px;
-}
-
-input[type=file] {
-    display:none;
-}
-
-.status {
-    color:#94a3b8;
-    font-size:12px;
-    text-align:center;
-    margin-top:10px;
-}
+button:disabled { opacity: 0.5; }
+.small { color: #bdc9d8; font-size: 13px; }
 </style>
 </head>
-
 <body>
-<div class="container">
-
-<h1>RIGAN AGI V16</h1>
-<p class="subtitle">ULTIMATE SELF-LEARNING INTELLIGENCE</p>
+<header>RIGAN AGI V16</header>
+<main>
+<p class="small">AI yako • Kiswahili • English • Memory • Images • Voice</p>
 
 <div id="chat">
-<div class="message ai">
-Habari! Mimi ni RIGAN AGI V16.
-
-Naweza kujibu maswali, kuchambua picha,
-kutafuta taarifa mtandaoni na kutengeneza picha.
-
-Niulize chochote!
-</div>
+<div class="msg bot">Karibu! Mimi ni RIGAN AGI. Niulize swali au nifundishe jambo jipya.</div>
 </div>
 
-<textarea id="question"
-placeholder="Andika swali au maelekezo hapa..."></textarea>
+<textarea id="message" placeholder="Andika ujumbe wako hapa..."></textarea>
 
-<div class="options">
-<label>
-<input type="checkbox" id="web">
-Tafuta mtandaoni
-</label>
-
-<label>
-<input type="checkbox" id="speak">
-Jibu kwa sauti
-</label>
+<div>
+<button onclick="sendMessage()">Tuma</button>
+<button onclick="startVoice()">🎤 Sauti</button>
+<button onclick="speakLast()">🔊 Soma jibu</button>
 </div>
 
-<div class="tools">
-<button id="sendBtn" onclick="sendMessage()">TUMA</button>
+<hr>
 
-<button onclick="generateImage()">CHORA PICHA</button>
+<p><b>Jifunze:</b> Andika ujumbe unaoanza na JIFUNZE: ili RIGAN ihifadhi maarifa.</p>
 
-<button onclick="startVoice()">ONGEA</button>
+<p><b>Tengeneza picha:</b></p>
+<textarea id="imagePrompt" placeholder="Eleza picha unayotaka RIGAN itengeneze..."></textarea>
+<button onclick="makeImage()">🎨 Tengeneza picha</button>
 
-<button onclick="stopVoice()">SIMAMISHA SAUTI</button>
-</div>
+<hr>
 
-<div class="tools">
-<button onclick="document.getElementById('imageFile').click()">
-PAKIA PICHA
-</button>
-<button onclick="learnHelp()">JIFUNZE
-</button>
-</div>
+<p><b>Chunguza picha:</b></p>
+<input type="file" id="photo" accept="image/*">
+<textarea id="photoQuestion" placeholder="Unataka RIGAN ichunguze nini kwenye picha?"></textarea>
+<button onclick="analyzePhoto()">Chunguza picha</button>
 
-<input type="file" id="imageFile" accept="image/*">
-
-<p class="status" id="status">
-RIGAN V16 ONLINE
-</p>
-
-</div>
+<p class="small" id="status"></p>
+</main>
 
 <script>
 const chat = document.getElementById("chat");
-const question = document.getElementById("question");
-const statusText = document.getElementById("status");
+let lastAnswer = "";
 
-function addMessage(text, type) {
+function addMessage(text, who) {
     const div = document.createElement("div");
-    div.className = "message " + type;
+    div.className = "msg " + who;
     div.textContent = text;
     chat.appendChild(div);
     chat.scrollTop = chat.scrollHeight;
     return div;
 }
 
-function addImage(src, type) {
-    const div = document.createElement("div");
-    div.className = "message " + type;
-
+function addImage(src) {
     const img = document.createElement("img");
+    img.className = "result";
     img.src = src;
-    img.alt = "RIGAN AI image";
-
-    div.appendChild(img);
-    chat.appendChild(div);
+    chat.appendChild(img);
     chat.scrollTop = chat.scrollHeight;
-}
-
-function speakText(text) {
-    if (!document.getElementById("speak").checked) return;
-
-    if (!("speechSynthesis" in window)) {
-        statusText.textContent = "Sauti haiungwi mkono kwenye browser hii.";
-        return;
-    }
-
-    window.speechSynthesis.cancel();
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "sw-KE";
-    utterance.rate = 1;
-
-    window.speechSynthesis.speak(utterance);
 }
 
 async function sendMessage() {
-    const message = question.value.trim();
+    const box = document.getElementById("message");
+    const message = box.value.trim();
     if (!message) return;
 
     addMessage(message, "user");
-    question.value = "";
-
-    const loading = addMessage("RIGAN anafikiri...", "ai");
-
-    statusText.textContent = "Inachakata...";
+    box.value = "";
+    const waiting = addMessage("RIGAN inafikiri...", "bot");
 
     try {
         const response = await fetch("/chat", {
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({
-                message:message,
-                use_web:document.getElementById("web").checked
-            })
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({message})
         });
 
         const data = await response.json();
-
-        if (!response.ok) throw new Error(data.error || "Tatizo.");
-
-        loading.textContent = data.reply;
-        speakText(data.reply);
-        statusText.textContent = "RIGAN ONLINE";
-
-    } catch(error) {
-        loading.textContent = "RIGAN ERROR: " + error.message;
-        statusText.textContent = "Kuna tatizo.";
+        waiting.textContent = data.answer || data.error || "Hitilafu imetokea.";
+        lastAnswer = data.answer || "";
+    } catch (error) {
+        waiting.textContent = "Tatizo la mtandao: " + error;
     }
-
-    chat.scrollTop = chat.scrollHeight;
 }
 
-async function generateImage() {
-    const prompt = question.value.trim();
+async function makeImage() {
+    const prompt = document.getElementById("imagePrompt").value.trim();
+    if (!prompt) return;
 
-    if (!prompt) {
-        alert("Andika maelekezo ya picha kwanza.");
-        return;
-    }
-
-    addMessage("Chora picha: " + prompt, "user");
-    question.value = "";
-
-    const loading = addMessage(
-        "RIGAN anatengeneza picha... Tafadhali subiri.",
-        "ai"
-    );
-
-    statusText.textContent = "Image generation...";
+    addMessage("Tengeneza picha: " + prompt, "user");
+    const waiting = addMessage("RIGAN inatengeneza picha...", "bot");
+    document.getElementById("status").textContent =
+        "Kutengeneza picha kunaweza kuchukua muda na kutumia salio la API.";
 
     try {
         const response = await fetch("/image", {
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({prompt:prompt})
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({prompt})
         });
 
         const data = await response.json();
 
-        if (!response.ok) throw new Error(data.error || "Picha imeshindikana.");
+        if (!response.ok) {
+            waiting.textContent = data.error || "Picha haikutengenezwa.";
+            return;
+        }
 
-        loading.remove();
-        addImage(data.image, "ai");
-
-        statusText.textContent = "Picha imeundwa.";
-
-    } catch(error) {
-        loading.textContent = "IMAGE ERROR: " + error.message;
-        statusText.textContent = "Image error.";
+        waiting.textContent = "Picha yako imetengenezwa:";
+        addImage(data.image);
+    } catch (error) {
+        waiting.textContent = "Hitilafu: " + error;
     }
 }
 
-document.getElementById("imageFile").addEventListener(
-    "change", async function() {
-
-    const file = this.files[0];
-    if (!file) return;
-
-    if (!file.type.startsWith("image/")) {
-        alert("Chagua picha.");
+async function analyzePhoto() {
+    const file = document.getElementById("photo").files[0];
+    if (!file) {
+        alert("Chagua picha kwanza.");
         return;
     }
 
-    if (file.size > 3 * 1024 * 1024) {
-        alert("Picha iwe chini ya 3 MB.");
-        this.value = "";
+    if (file.size > 5 * 1024 * 1024) {
+        alert("Picha iwe chini ya 5 MB.");
         return;
     }
 
-    const reader = new FileReader();
+    const question = document.getElementById("photoQuestion").value;
+    addMessage("Nimepakia picha. " + question, "user");
+    const waiting = addMessage("RIGAN inachunguza picha...", "bot");
 
-    reader.onload = async function() {
-        const imageData = reader.result;
+    try {
+        const form = new FormData();
+        form.append("photo", file);
+        form.append("question", question);
 
-        addImage(imageData, "user");
+        const response = await fetch("/vision", {
+            method: "POST",
+            body: form
+        });
 
-        const prompt = question.value.trim() ||
-            "Chambua picha hii na nieleze unaona nini.";
+        const data = await response.json();
+        waiting.textContent = data.answer || data.error || "Hitilafu imetokea.";
+        lastAnswer = data.answer || "";
+    } catch (error) {
+        waiting.textContent = "Hitilafu: " + error;
+    }
+}
 
-        question.value = "";
+function speakLast() {
+    if (!lastAnswer) {
+        alert("Hakuna jibu la kusoma bado.");
+        return;
+    }
 
-        const loading = addMessage(
-            "RIGAN anachunguza picha...",
-            "ai"
-        );
+    if (!("speechSynthesis" in window)) {
+        alert("Simu au browser hii haitumii kusoma kwa sauti.");
+        return;
+    }
 
-        try {
-            const response = await fetch("/vision", {
-                method:"POST",
-                headers:{"Content-Type":"application/json"},
-                body:JSON.stringify({
-                    message:prompt,
-                    image:imageData
-                })
-            });
-
-            const data = await response.json();
-
-            if (!response.ok) throw new Error(data.error || "Vision error.");
-
-            loading.textContent = data.reply;
-            speakText(data.reply);
-
-        } catch(error) {
-            loading.textContent = "VISION ERROR: " + error.message;
-        }
-    };
-
-    reader.readAsDataURL(file);
-    this.value = "";
-});
+    const speech = new SpeechSynthesisUtterance(lastAnswer);
+    speech.lang = "sw-KE";
+    speech.rate = 1;
+    speechSynthesis.cancel();
+    speechSynthesis.speak(speech);
+}
 
 function startVoice() {
-    const SpeechRecognition =
-        window.SpeechRecognition ||
-        window.webkitSpeechRecognition;
+    const Recognition =
+        window.SpeechRecognition || window.webkitSpeechRecognition;
 
-    if (!SpeechRecognition) {
-        alert("Browser hii haiungi mkono speech recognition. Jaribu Chrome.");
+    if (!Recognition) {
+        alert("Voice input haipatikani kwenye browser hii.");
         return;
     }
 
-    const recognition = new SpeechRecognition();
+    const recognition = new Recognition();
     recognition.lang = "sw-KE";
-    recognition.continuous = false;
     recognition.interimResults = false;
 
-    recognition.onstart = function() {
-        statusText.textContent = "RIGAN anasikiliza...";
-    };
-
     recognition.onresult = function(event) {
-        question.value = event.results[0][0].transcript;
-        statusText.textContent = "Sauti imepokelewa.";
+        document.getElementById("message").value =
+            event.results[0][0].transcript;
     };
 
-    recognition.onerror = function(event) {
-        statusText.textContent = "Voice error: " + event.error;
-    };
-
-    recognition.onend = function() {
-        if (statusText.textContent === "RIGAN anasikiliza...") {
-            statusText.textContent = "Usikilizaji umemalizika.";
-        }
+    recognition.onerror = function() {
+        alert("Voice haikufanya kazi. Ruhusu microphone kwenye browser.");
     };
 
     recognition.start();
-    window.riganRecognition = recognition;
 }
-
-function stopVoice() {
-    if (window.riganRecognition) {
-        window.riganRecognition.stop();
-    }
-
-    if ("speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-    }
-
-    statusText.textContent = "Sauti imesimamishwa.";
-}
-
-function learnHelp() {
-    question.value = "JIFUNZE: ";
-    question.focus();
-}
-
-question.addEventListener("keydown", function(event) {
-    if (event.key === "Enter" && !event.shiftKey) {
-        event.preventDefault();
-        sendMessage();
-    }
-});
 </script>
 </body>
 </html>
 """
 
 
-# ==========================================
-# FLASK ROUTES
-# ==========================================
+# ---------------- ROUTES ----------------
 
 @app.route("/")
 def home():
-    return render_template_string(HTML)
+    return render_template_string(PAGE)
 
 
 @app.route("/chat", methods=["POST"])
-@app.route("/ask", methods=["POST"])
-def chat():
-    data = request.get_json(silent=True) or {}
-
-    message = data.get("message") or data.get("question")
-    use_web = data.get("use_web") is True
-
-    if not isinstance(message, str) or not message.strip():
-        return jsonify({"error": "Andika swali kwanza."}), 400
-
+def chat_route():
     try:
-        answer = ask_rigan(message.strip(), use_web)
+        data = request.get_json(silent=True) or {}
+        message = str(data.get("message", "")).strip()
 
-        return jsonify({
-            "reply": answer,
-            "answer": answer,
-            "status": "success"
-        })
+        if not message:
+            return jsonify({"error": "Andika ujumbe kwanza."}), 400
+
+        if message.upper().startswith("JIFUNZE:") or \
+           message.upper().startswith("LEARN:"):
+
+            fact = message.split(":", 1)[1].strip()
+
+            if not fact:
+                return jsonify({
+                    "error": "Andika maarifa baada ya JIFUNZE:"
+                }), 400
+
+            save_knowledge(fact)
+            save_memory("user", message)
+
+            answer = (
+                "Nimehifadhi maarifa haya kwenye kumbukumbu "
+                "ya RIGAN. Unaweza kuniuliza baadaye."
+            )
+
+            save_memory("assistant", answer)
+
+            return jsonify({"answer": answer})
+
+        answer = ask_rigan(message)
+        return jsonify({"answer": answer})
 
     except Exception as error:
         app.logger.exception("RIGAN CHAT ERROR")
         return jsonify({
-            "error": "RIGAN CHAT ERROR: " + str(error)[:
+            "error": "RIGAN CHAT ERROR: " + str(error)[:1200]
+        }), 500
+
+
+@app.route("/vision", methods=["POST"])
+def vision_route():
+    try:
+        photo = request.files.get("photo")
+
+        if not photo:
+            return jsonify({"error": "Pakia picha kwanza."}), 400
+
+        mime = photo.mimetype or ""
+
+        if not mime.startswith("image/"):
+            return jsonify({"error": "Faili lazima liwe picha."}), 400
+
+        raw = photo.read()
+
+        if len(raw) > 5 * 1024 * 1024:
+            return jsonify({"error": "Picha iwe chini ya 5 MB."}), 400
+
+        encoded = base64.b64encode(raw).decode("utf-8")
+        question = request.form.get("question", "")
+
+        answer = understand_image(encoded, mime, question)
+        return jsonify({"answer": answer})
+
+    except Exception as error:
+        app.logger.exception("RIGAN VISION ERROR")
+        return jsonify({
+            "error": "RIGAN VISION ERROR: " + str(error)[:1200]
+        }), 500
+
+
+@app.route("/image", methods=["POST"])
+def image_route():
+    try:
+        data = request.get_json(silent=True) or {}
+        prompt = str(data.get("prompt", "")).strip()
+
+        if not prompt:
+            return jsonify({"error": "Eleza picha unayotaka."}), 400
+
+        image = generate_image(prompt)
+        return jsonify({"image": image})
+
+    except Exception as error:
+        app.logger.exception("RIGAN IMAGE ERROR")
+        return jsonify({
+            "error": "RIGAN IMAGE ERROR: " + str(error)[:1200]
+        }), 500
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "RIGAN AGI is running",
+        "owner": OWNER_NAME,
+        "model": MODEL,
+        "database": "configured",
+        "version": "V16"
+    })
+
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000))
+)
