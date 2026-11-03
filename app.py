@@ -1,381 +1,405 @@
 
 import os
-import sqlite3
 import uuid
 from datetime import datetime, timezone
 
-from flask import Flask, request, jsonify, session, render_template_string
+from flask import (
+    Flask, request, jsonify, session,
+    render_template_string
+)
 from openai import OpenAI
+from sqlalchemy import (
+    create_engine, Column, String, Text,
+    DateTime, Integer
+)
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+# =========================
+# RIGAN AGI V15
+# =========================
 
 app = Flask(__name__)
-
-app.secret_key = os.environ.get(
-    "SECRET_KEY", "change-this-rigan-secret"
-)
+app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret")
 
 OWNER_NAME = os.environ.get("OWNER_NAME", "RIGAN Creator")
 
-# OpenRouter key: sk-or-v1-...
 API_KEY = (
     os.environ.get("OPENROUTER_API_KEY")
     or os.environ.get("OPENAI_API_KEY")
+    or os.environ.get("OPENAI_KEY")
 )
 
-MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+MODEL = os.environ.get(
+    "OPENROUTER_MODEL",
+    "openai/gpt-4o-mini"
+)
 
-DB_FILE = os.environ.get("DB_PATH", "rigan_memory.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
+if not API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY haijawekwa Render Environment")
 
-# ---------------- DATABASE ----------------
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL haijawekwa. Tengeneza PostgreSQL kwenye Render."
+    )
 
-def get_db():
-    con = sqlite3.connect(DB_FILE, timeout=30)
-    con.row_factory = sqlite3.Row
-    return con
+# Render PostgreSQL compatibility
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgres://", "postgresql://", 1
+    )
 
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=300
+)
 
-def setup_database():
-    with get_db() as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fact TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS conversations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
+Base = declarative_base()
+DBSession = sessionmaker(bind=engine)
 
 
-setup_database()
+class Memory(Base):
+    __tablename__ = "rigan_memory"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(100), index=True)
+    role = Column(String(20))
+    content = Column(Text)
+    created_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc)
+    )
 
 
-# ---------------- MEMORY SYSTEM ----------------
+class Knowledge(Base):
+    __tablename__ = "rigan_knowledge"
 
-def save_memory(fact):
-    fact = fact.strip()
-
-    if not fact:
-        return
-
-    with get_db() as con:
-        con.execute(
-            "INSERT INTO memories (fact, created_at) VALUES (?, ?)",
-            (fact, datetime.now(timezone.utc).isoformat())
-        )
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(100), index=True)
+    content = Column(Text)
+    created_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc)
+    )
 
 
-def get_memories():
-    with get_db() as con:
-        rows = con.execute("""
-            SELECT fact FROM memories
-            ORDER BY id DESC LIMIT 100
-        """).fetchall()
-
-    return [row["fact"] for row in reversed(rows)]
+Base.metadata.create_all(engine)
 
 
-def save_message(sid, role, content):
-    with get_db() as con:
-        con.execute("""
-            INSERT INTO conversations
-            (session_id, role, content, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (
-            sid,
-            role,
-            content,
-            datetime.now(timezone.utc).isoformat()
+# =========================
+# OPENROUTER
+# =========================
+
+client = OpenAI(
+    api_key=API_KEY,
+    base_url="https://openrouter.ai/api/v1",
+    default_headers={
+        "HTTP-Referer": os.environ.get(
+            "APP_URL", "https://riganai.onrender.com"
+        ),
+        "X-Title": "RIGAN AGI V15"
+    }
+)
+
+
+# =========================
+# USER MEMORY
+# =========================
+
+def get_user_id():
+    if "user_id" not in session:
+        session["user_id"] = str(uuid.uuid4())
+    return session["user_id"]
+
+
+def save_memory(user_id, role, content):
+    db = DBSession()
+    try:
+        db.add(Memory(
+            user_id=user_id,
+            role=role,
+            content=content[:12000]
         ))
+        db.commit()
+    finally:
+        db.close()
 
 
-def get_history(sid):
-    with get_db() as con:
-        rows = con.execute("""
-            SELECT role, content FROM conversations
-            WHERE session_id = ?
-            ORDER BY id DESC LIMIT 16
-        """, (sid,)).fetchall()
-
-    return [
-        {"role": row["role"], "content": row["content"]}
-        for row in reversed(rows)
-    ]
-
-
-# ---------------- OPENROUTER AI ----------------
-
-def get_client():
-    if not API_KEY:
-        raise RuntimeError(
-            "OPENROUTER_API_KEY haijawekwa kwenye Render."
+def get_history(user_id, limit=15):
+    db = DBSession()
+    try:
+        rows = (
+            db.query(Memory)
+            .filter_by(user_id=user_id)
+            .order_by(Memory.id.desc())
+            .limit(limit)
+            .all()
         )
+        return [
+            {"role": row.role, "content": row.content}
+            for row in reversed(rows)
+        ]
+    finally:
+        db.close()
 
-    return OpenAI(
-        api_key=API_KEY,
-        base_url="https://openrouter.ai/api/v1",
-        default_headers={
-            "X-OpenRouter-Title": "RIGAN AI"
-        }
+
+def save_knowledge(user_id, content):
+    db = DBSession()
+    try:
+        db.add(Knowledge(
+            user_id=user_id,
+            content=content[:10000]
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+
+def get_knowledge(user_id):
+    db = DBSession()
+    try:
+        rows = (
+            db.query(Knowledge)
+            .filter_by(user_id=user_id)
+            .order_by(Knowledge.id.desc())
+            .limit(30)
+            .all()
+        )
+        return [row.content for row in reversed(rows)]
+    finally:
+        db.close()
+
+
+# =========================
+# AI PERSONALITY
+# =========================
+
+def system_prompt(user_id):
+    knowledge = get_knowledge(user_id)
+
+    saved_facts = "\n".join(
+        "- " + item for item in knowledge
     )
 
+    return f"""
+You are RIGAN AGI V15, an advanced personal AI assistant.
 
-def ai_reply(message, sid):
+Your creator and owner is {OWNER_NAME}.
 
-    memories = get_memories()
+IDENTITY:
+- Your name is RIGAN AGI.
+- Respect your creator.
+- Communicate in Swahili and English.
+- Answer clearly and intelligently.
 
-    memory_text = "\n".join(
-        "- " + item for item in memories
-    )
+KNOWLEDGE:
+- Science
+- Education
+- Technology
+- Mathematics
+- History
+- Geography
+- Programming
+- Artificial intelligence
+- General world knowledge
 
-    if not memory_text:
-        memory_text = "Hakuna kumbukumbu bado."
+MEMORY:
+Use the saved knowledge below when relevant.
+Do not invent memories or claim to remember things
+that are not in your available context.
 
-    system_prompt = f"""
-Wewe ni RIGAN AI.
+SAVED KNOWLEDGE:
+{saved_facts}
 
-Jina la mtengenezaji wako ni {OWNER_NAME}.
-
-MAJUKUMU:
-1. Jibu maswali kwa Kiswahili na Kiingereza.
-2. Saidia kwenye sayansi, elimu na teknolojia.
-3. Eleza mambo kwa lugha rahisi na sahihi.
-4. Jibu kwa heshima na kwa undani unaohitajika.
-5. Usibuni taarifa usizozijua.
-6. Tumia kumbukumbu zinazohusika kujibu maswali.
-7. Usidai kuwa umejifunza jambo ambalo hujahifadhi.
-
-KUMBUKUMBU ZA RIGAN:
-{memory_text}
+IMPORTANT:
+- Be honest when you do not know something.
+- Explain difficult subjects simply.
+- Never claim to have learned information unless it was saved.
+- You are an AI assistant, not an all-knowing being.
 """
 
-    client = get_client()
+
+# =========================
+# CHAT ENGINE
+# =========================
+
+def ask_rigan(user_message):
+    user_id = get_user_id()
+
+    if not user_message or len(user_message) > 12000:
+        return "Tafadhali tuma ujumbe wenye urefu unaofaa."
+
+    # Explicit learning command
+    if user_message.strip().lower().startswith(
+        ("jifunze:", "learn:")
+    ):
+        fact = user_message.split(":", 1)[1].strip()
+
+        if not fact:
+            return "Andika taarifa unayotaka nijifunze."
+
+        save_knowledge(user_id, fact)
+
+        answer = (
+            "Nimehifadhi taarifa hii kwenye kumbukumbu yangu "
+            "ya kudumu. Nitaitumia itakapohitajika."
+        )
+        save_memory(user_id, "user", user_message)
+        save_memory(user_id, "assistant", answer)
+        return answer
+
+    history = get_history(user_id)
 
     messages = [
-        {"role": "system", "content": system_prompt}
+        {
+            "role": "system",
+            "content": system_prompt(user_id)
+        }
     ]
 
-    messages.extend(get_history(sid))
-
+    messages.extend(history)
     messages.append({
         "role": "user",
-        "content": message
+        "content": user_message
     })
 
     response = client.chat.completions.create(
         model=MODEL,
         messages=messages,
         temperature=0.7,
-        max_tokens=1500
+        max_tokens=1800
     )
 
     answer = response.choices[0].message.content
 
     if not answer:
-        return "Samahani, sijapata jibu. Jaribu tena."
+        answer = "Samahani, sijapata jibu."
+
+    save_memory(user_id, "user", user_message)
+    save_memory(user_id, "assistant", answer)
 
     return answer
 
 
-# ---------------- WEBSITE ----------------
+# =========================
+# WEBSITE
+# =========================
 
-PAGE = """
+HTML = """
 <!DOCTYPE html>
 <html lang="sw">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RIGAN AI</title>
-
+<title>RIGAN AGI V15</title>
 <style>
 body {
-    background: #101827;
-    color: white;
-    font-family: Arial, sans-serif;
-    margin: 0;
-    padding: 15px;
+    background:#101827;
+    color:white;
+    font-family:Arial;
+    margin:0;
+    padding:20px;
 }
-
-h2 {
-    color: #35d6c5;
-    text-align: center;
+.container {
+    max-width:700px;
+    margin:auto;
 }
-
-.subtitle {
-    text-align: center;
-    color: #aab7c5;
-}
-
+h1 {color:#38bdf8;text-align:center;}
 #chat {
-    max-width: 750px;
-    height: 65vh;
-    overflow-y: auto;
-    margin: 20px auto;
-    padding: 15px;
-    background: #1b293c;
-    border-radius: 12px;
+    background:#1e293b;
+    padding:15px;
+    border-radius:12px;
+    height:55vh;
+    overflow-y:auto;
+    margin-bottom:12px;
 }
-
-.msg {
-    padding: 12px;
-    margin: 12px 0;
-    border-radius: 10px;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    line-height: 1.5;
+.message {
+    padding:12px;
+    margin:10px 0;
+    border-radius:10px;
+    white-space:pre-wrap;
 }
-
-.user {
-    background: #245b80;
-    text-align: right;
+.user {background:#075985;}
+.ai {background:#334155;}
+textarea {
+    width:100%;
+    box-sizing:border-box;
+    height:75px;
+    padding:12px;
+    border-radius:10px;
+    font-size:16px;
 }
-
-.ai {
-    background: #334155;
-}
-
-.controls {
-    display: flex;
-    max-width: 750px;
-    margin: auto;
-    gap: 8px;
-}
-
-input {
-    flex: 1;
-    min-width: 0;
-    padding: 14px;
-    border-radius: 8px;
-    border: none;
-    font-size: 16px;
-}
-
 button {
-    background: #19b9a7;
-    color: white;
-    border: none;
-    border-radius: 8px;
-    padding: 12px 18px;
-    cursor: pointer;
+    width:100%;
+    padding:14px;
+    margin-top:10px;
+    background:#0284c7;
+    color:white;
+    border:0;
+    border-radius:10px;
+    font-size:17px;
 }
-
-button:disabled {
-    opacity: 0.5;
-}
-
-.footer {
-    text-align: center;
-    color: #8795a6;
-    margin-top: 20px;
-    font-size: 12px;
-}
+small {color:#94a3b8;}
 </style>
 </head>
-
 <body>
-
-<h2>RIGAN AI 🧠</h2>
-
-<div class="subtitle">
-LONG-TERM MEMORY | INTELLIGENT ASSISTANT
-</div>
-
+<div class="container">
+<h1>RIGAN AGI V15</h1>
+<p style="text-align:center">Your Personal AI Assistant</p>
 <div id="chat">
-    <div class="msg ai">
-        Karibu kwenye RIGAN AI!
-        Niulize swali lolote.
-    </div>
+<div class="message ai">Habari! Mimi ni RIGAN AGI V15.
+Niulize swali au niambie nijifunze taarifa mpya.</div>
 </div>
-
-<div class="controls">
-    <input id="message"
-           placeholder="Andika swali lako...">
-    <button id="send" onclick="sendMessage()">
-        TUMA
-    </button>
-</div>
-
-<div class="footer">
-    RIGAN AI - Created by RIGAN Creator
+<textarea id="question" placeholder="Andika swali lako hapa..."></textarea>
+<button onclick="sendMessage()">TUMA UJUMBE</button>
+<p><small>Kwa kujifunza taarifa mpya, tumia: JIFUNZE: taarifa yako.</small></p>
 </div>
 
 <script>
 async function sendMessage() {
-
-    const input = document.getElementById("message");
+    const input = document.getElementById("question");
     const chat = document.getElementById("chat");
-    const button = document.getElementById("send");
-
     const message = input.value.trim();
 
-    if (!message || button.disabled) return;
+    if (!message) return;
 
-    const user = document.createElement("div");
-    user.className = "msg user";
-    user.textContent = message;
-    chat.appendChild(user);
-
+    chat.innerHTML += '<div class="message user"></div>';
+    chat.lastElementChild.textContent = message;
     input.value = "";
-    button.disabled = true;
 
-    const answer = document.createElement("div");
-    answer.className = "msg ai";
-    answer.textContent = "RIGAN AI inafikiria...";
-    chat.appendChild(answer);
-
+    const loading = document.createElement("div");
+    loading.className = "message ai";
+    loading.textContent = "RIGAN anafikiri...";
+    chat.appendChild(loading);
     chat.scrollTop = chat.scrollHeight;
 
     try {
-
         const response = await fetch("/chat", {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                message: message
-            })
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({message: message})
         });
 
         const data = await response.json();
-
-        if (!response.ok) {
-            answer.textContent =
-                data.reply || "Tatizo limetokea.";
-        } else {
-            answer.textContent = data.reply;
-        }
-
+        loading.textContent = data.reply || data.error || "Hakuna jibu.";
     } catch (error) {
-
-        answer.textContent =
-            "Imeshindikana kuunganisha na RIGAN AI.";
-
-    } finally {
-
-        button.disabled = false;
-        chat.scrollTop = chat.scrollHeight;
-        input.focus();
-
+        loading.textContent = "Tatizo la muunganisho. Jaribu tena.";
     }
+
+    chat.scrollTop = chat.scrollHeight;
 }
 
-document.getElementById("message")
-.addEventListener("keydown", function(event) {
-    if (event.key === "Enter") {
-        sendMessage();
+document.getElementById("question").addEventListener(
+    "keydown", function(e) {
+        if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
     }
-});
+);
 </script>
-
 </body>
 </html>
 """
@@ -383,118 +407,42 @@ document.getElementById("message")
 
 @app.route("/")
 def home():
+    return render_template_string(HTML)
 
-    if "sid" not in session:
-        session["sid"] = str(uuid.uuid4())
-
-    return render_template_string(PAGE)
-
-
-# ---------------- CHAT API ----------------
 
 @app.route("/chat", methods=["POST"])
+@app.route("/ask", methods=["POST"])
 def chat():
+    data = request.get_json(silent=True) or {}
+
+    message = data.get("message") or data.get("question")
+
+    if not isinstance(message, str) or not message.strip():
+        return jsonify({"error": "Andika swali kwanza."}), 400
 
     try:
-
-        if "sid" not in session:
-            session["sid"] = str(uuid.uuid4())
-
-        data = request.get_json(silent=True) or {}
-
-        message = str(data.get("message", "")).strip()
-
-        if not message:
-            return jsonify({
-                "reply": "Tafadhali andika swali lako."
-            }), 400
-
-        if len(message) > 10000:
-            return jsonify({
-                "reply": "Ujumbe ni mrefu sana."
-            }), 400
-
-        sid = session["sid"]
-
-        # Mfumo wa kufundisha na kuhifadhi kumbukumbu
-        lower = message.lower()
-
-        triggers = [
-            "kumbuka kwamba",
-            "kumbuka kuwa",
-            "remember that",
-            "jifunze kwamba"
-        ]
-
-        for trigger in triggers:
-
-            if lower.startswith(trigger):
-
-                fact = message[len(trigger):].strip()
-
-                if not fact:
-                    return jsonify({
-                        "reply": "Andika taarifa unayotaka nikumbuke."
-                    })
-
-                save_memory(fact)
-
-                reply = (
-                    "Nimehifadhi taarifa hii kwenye kumbukumbu yangu: "
-                    + fact
-                )
-
-                save_message(sid, "user", message)
-                save_message(sid, "assistant", reply)
-
-                return jsonify({"reply": reply})
-
-        # Pata jibu la AI
-        answer = ai_reply(message, sid)
-
-        save_message(sid, "user", message)
-        save_message(sid, "assistant", answer)
-
-        return jsonify({"reply": answer})
-
-    except Exception as error:
-
-        print("RIGAN ERROR:", repr(error))
-
+        answer = ask_rigan(message.strip())
         return jsonify({
-            "reply": "Samahani, kuna tatizo. Angalia Render Logs."
+            "reply": answer,
+            "answer": answer,
+            "status": "success"
+        })
+    except Exception as error:
+        app.logger.exception("RIGAN CHAT ERROR")
+        return jsonify({
+            "error": "RIGAN ERROR: " + str(error)
         }), 500
 
 
-# ---------------- MEMORY VIEW ----------------
-
-@app.route("/memory", methods=["GET"])
-def memory():
-
-    return jsonify({
-        "owner": OWNER_NAME,
-        "memories": get_memories()
-    })
-
-
-# ---------------- HEALTH CHECK ----------------
-
 @app.route("/health")
 def health():
-
     return jsonify({
         "status": "online",
-        "name": "RIGAN AI",
-        "provider": "OpenRouter"
+        "name": "RIGAN AGI V15",
+        "owner": OWNER_NAME
     })
 
 
-# ---------------- START SERVER ----------------
-
 if __name__ == "__main__":
-
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000))
-    )
-    
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
