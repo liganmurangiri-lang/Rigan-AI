@@ -1,6 +1,0 @@
-
-Flask
-gunicorn
-requests
-SQLAlchemy
-psycopg2-binary
