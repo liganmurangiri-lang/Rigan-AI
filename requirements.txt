@@ -1,6 +1,6 @@
 
 Flask
 gunicorn
-requests
+openai
 SQLAlchemy
-psycopg2-binary
+psycopg[binary]
