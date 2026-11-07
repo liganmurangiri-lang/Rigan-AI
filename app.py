@@ -1080,5 +1080,84 @@ document.getElementById("listen").onclick = () => {
         input.value =
             event.results[0][0].transcript;
 
-        status(
-            "Sauti imegeuzwa maandishi. Bonyeza T
+   status(
+    "Sauti imegeuzwa maandishi. Bonyeza Tuma."
+    );
+    };
+
+    recognition.onerror = () => {
+        status("Imeshindikana kusikia sauti. Jaribu tena.");
+    };
+
+    recognition.onend = () => {
+        if (micButton) {
+            micButton.textContent = "🎤";
+        }
+    };
+
+    async function sendMessage() {
+        const message = input.value.trim();
+
+        if (!message) return;
+
+        addMessage("user", message);
+        input.value = "";
+        status("RIGAN anafikiria...");
+
+        sendButton.disabled = true;
+
+        try {
+            const response = await fetch("/api/chat", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    message: message
+                })
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.error || "Tatizo limetokea.");
+            }
+
+            addMessage("assistant", data.reply || "Sijapata jibu.");
+            status("RIGAN yuko tayari.");
+
+        } catch (error) {
+            addMessage("assistant", "Hitilafu: " + error.message);
+            status("Jaribu tena.");
+        }
+
+        sendButton.disabled = false;
+    }
+
+    sendButton.addEventListener("click", sendMessage);
+
+    input.addEventListener("keydown", event => {
+        if (event.key === "Enter") {
+            sendMessage();
+        }
+    });
+
+    if (micButton && recognition) {
+        micButton.addEventListener("click", () => {
+            recognition.start();
+            micButton.textContent = "🔴";
+            status("Ninasikiliza...");
+        });
+    }
+
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000))
+    )
