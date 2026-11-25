@@ -2,24 +2,44 @@ import os
 import uuid
 import base64
 import sqlite3
-from datetime import datetime, timezone
+import secrets
+import hmac
+import time
+import logging
+from collections import defaultdict, deque
+from datetime import datetime, timezone, timedelta
+from functools import wraps
+from threading import Lock
+from urllib.parse import urlparse
 
 import requests
-from flask import Flask, request, jsonify, render_template_string
+from flask import (
+    Flask, request, jsonify, render_template_string, session
+)
 
 try:
     import psycopg2
-    from psycopg2.extras import RealDictCursor
 except Exception:
     psycopg2 = None
-    RealDictCursor = None
 
+
+# =========================================================
+# RIGAN AI - SECURITY HARDENED EDITION
+# Keeps: Chat, Vision, Image Generation, browser voice,
+# PostgreSQL/Neon, SQLite fallback, and conversation history.
+# =========================================================
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
 APP_NAME = "RIGAN AI"
-OWNER_NAME = os.getenv("OWNER_NAME", "Ligan Murangiri").strip() or "Ligan Murangiri"
+OWNER_NAME = (
+    os.getenv("OWNER_NAME", "Ligan Murangiri").strip()
+    or "Ligan Murangiri"
+)
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+SQLITE_FILE = os.getenv("SQLITE_FILE", "rigan_v16.db")
 
 OPENROUTER_API_KEY = (
     os.getenv("OPENROUTER_API_KEY")
@@ -32,9 +52,40 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 CHAT_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 VISION_MODEL = os.getenv("VISION_MODEL", "google/gemini-2.5-flash")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "google/gemini-2.5-flash-image")
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+APP_URL = os.getenv("APP_URL", "https://riganai.onrender.com").strip()
 
-SQLITE_FILE = os.getenv("SQLITE_FILE", "rigan_v16.db")
+MAX_IMAGE_SIZE = 6 * 1024 * 1024
+MAX_MESSAGE_LENGTH = 12000
+MAX_IMAGE_PROMPT = 1500
+CHAT_TIMEOUT = (15, 120)
+IMAGE_TIMEOUT = (15, 180)
+
+# Set FLASK_SECRET_KEY in Render Environment.
+SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    SECRET_KEY = secrets.token_urlsafe(48)
+    app.logger.warning(
+        "FLASK_SECRET_KEY is missing. Sessions may reset after restart."
+    )
+
+app.secret_key = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+    SESSION_REFRESH_EACH_REQUEST=True,
+)
+
+logging.basicConfig(level=logging.INFO)
+
+if DATABASE_URL and not psycopg2:
+    raise RuntimeError(
+        "DATABASE_URL is set but psycopg2-binary is unavailable."
+    )
+
+if urlparse(OPENROUTER_BASE_URL).hostname != "openrouter.ai":
+    raise RuntimeError("Invalid OpenRouter API host.")
 
 
 SYSTEM_PROMPT = f"""
@@ -43,14 +94,16 @@ You are helpful, truthful, respectful, and clear.
 You can answer questions, explain ideas, help with learning and writing,
 analyze images supplied by the user, and help generate images when the
 image-generation service is available.
-Do not claim to have abilities or access that you do not have.
-If an image-generation request fails, explain that the image service or
-selected model may not be available; do not pretend an image was created.
+Do not claim abilities or access that you do not have.
+If image generation fails, explain that the image service or selected
+model may not be available; do not pretend an image was created.
 Reply in the language used by the user. You can communicate in Swahili
 and English. Be concise unless the user asks for detail.
 Only mention the creator when the user asks who created or owns you.
 """
 
+
+# ------------------------- DATABASE -------------------------
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
@@ -61,7 +114,11 @@ def db_connect():
         url = DATABASE_URL
         if url.startswith("postgres://"):
             url = "postgresql://" + url[len("postgres://"):]
-        return psycopg2.connect(url, connect_timeout=15)
+        return psycopg2.connect(
+            url,
+            connect_timeout=15,
+            sslmode="require"
+        )
 
     conn = sqlite3.connect(SQLITE_FILE, timeout=20)
     conn.row_factory = sqlite3.Row
@@ -72,34 +129,19 @@ def init_db():
     conn = db_connect()
     try:
         cur = conn.cursor()
-        if DATABASE_URL and psycopg2:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS chat_messages (
-                    id TEXT PRIMARY KEY,
-                    conversation_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation
-                ON chat_messages (conversation_id, created_at)
-            """)
-        else:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS chat_messages (
-                    id TEXT PRIMARY KEY,
-                    conversation_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation
-                ON chat_messages (conversation_id, created_at)
-            """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation
+            ON chat_messages (conversation_id, created_at)
+        """)
         conn.commit()
     finally:
         conn.close()
@@ -109,18 +151,22 @@ def save_message(conversation_id, role, content):
     conn = db_connect()
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
+        sql = """
             INSERT INTO chat_messages
             (id, conversation_id, role, content, created_at)
             VALUES (%s, %s, %s, %s, %s)
-            """ if DATABASE_URL and psycopg2 else """
+        """ if DATABASE_URL and psycopg2 else """
             INSERT INTO chat_messages
             (id, conversation_id, role, content, created_at)
             VALUES (?, ?, ?, ?, ?)
-            """,
-            (str(uuid.uuid4()), conversation_id, role, str(content), utc_now())
-        )
+        """
+        cur.execute(sql, (
+            str(uuid.uuid4()),
+            conversation_id,
+            role,
+            str(content),
+            utc_now()
+        ))
         conn.commit()
     finally:
         conn.close()
@@ -130,43 +176,144 @@ def get_history(conversation_id, limit=20):
     conn = db_connect()
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
+        sql = """
             SELECT role, content FROM chat_messages
             WHERE conversation_id = %s
             ORDER BY created_at DESC LIMIT %s
-            """ if DATABASE_URL and psycopg2 else """
+        """ if DATABASE_URL and psycopg2 else """
             SELECT role, content FROM chat_messages
             WHERE conversation_id = ?
             ORDER BY created_at DESC LIMIT ?
-            """,
-            (conversation_id, limit)
-        )
-        rows = cur.fetchall()
-        rows = list(reversed(rows))
-        result = []
-        for row in rows:
-            if isinstance(row, dict):
-                role, content = row["role"], row["content"]
-            else:
-                role, content = row[0], row[1]
-            result.append({"role": role, "content": content})
-        return result
+        """
+        cur.execute(sql, (conversation_id, limit))
+        rows = list(reversed(cur.fetchall()))
+        return [
+            {"role": row[0], "content": row[1]}
+            for row in rows
+        ]
     finally:
         conn.close()
 
 
+# ------------------------- RATE LIMITING -------------------------
+# In-process limiter. For multiple Render instances, use a shared
+# Redis/database-backed limiter in a later deployment.
+
+_RATE_LOCK = Lock()
+_RATE_BUCKETS = defaultdict(deque)
+_RATE_RULES = {
+    "chat": (20, 60),
+    "image": (5, 60),
+    "session": (30, 60),
+}
+_RATE_MAX_KEYS = 10000
+
+
+def rate_limit(kind):
+    limit, window = _RATE_RULES[kind]
+
+    def decorator(func):
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            now = time.monotonic()
+            identity = session.get("conversation_id")
+            if not identity:
+                identity = request.remote_addr or "unknown"
+            key = (kind, str(identity))
+
+            with _RATE_LOCK:
+                bucket = _RATE_BUCKETS[key]
+                while bucket and now - bucket[0] > window:
+                    bucket.popleft()
+
+                if len(bucket) >= limit:
+                    return jsonify(
+                        error="Maombi ni mengi sana. Tafadhali subiri kidogo."
+                    ), 429
+
+                bucket.append(now)
+
+                if len(_RATE_BUCKETS) > _RATE_MAX_KEYS:
+                    _RATE_BUCKETS.clear()
+
+            return func(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+# ------------------------- SESSION / CSRF -------------------------
+
+def ensure_session():
+    if not session.get("conversation_id"):
+        session["conversation_id"] = str(uuid.uuid4())
+        session["csrf_token"] = secrets.token_urlsafe(32)
+        session.permanent = True
+
+    if not session.get("csrf_token"):
+        session["csrf_token"] = secrets.token_urlsafe(32)
+
+    return session["conversation_id"], session["csrf_token"]
+
+
+def require_csrf(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        expected = session.get("csrf_token", "")
+        supplied = request.headers.get("X-CSRF-Token", "")
+
+        if (
+            not expected
+            or not supplied
+            or not hmac.compare_digest(expected, supplied)
+        ):
+            return jsonify(
+                error="Session security check failed. Refresh the page."
+            ), 403
+
+        return func(*args, **kwargs)
+    return wrapped
+
+
+# ------------------------- CREATOR IDENTITY -------------------------
+
+def creator_identity_answer(message):
+    text = (message or "").lower()
+    patterns = (
+        "who created you", "who made you", "who is your creator",
+        "who owns you", "who developed you", "who built you",
+        "nani amekutengeneza", "nani alikutengeneza",
+        "nani alikuumba", "nani mmiliki wako",
+        "nani amekuunda", "umetengenezwa na nani",
+        "uliundwa na nani", "mtengenezaji wako ni nani",
+    )
+    if any(pattern in text for pattern in patterns):
+        return (
+            f"Mimi ni {APP_NAME}. Nimetengenezwa na kumilikiwa na "
+            f"{OWNER_NAME}."
+        )
+    return None
+
+
+# ------------------------- OPENROUTER -------------------------
+
 def api_headers():
     if not OPENROUTER_API_KEY:
-        raise RuntimeError(
-            "OPENROUTER_API_KEY haijawekwa kwenye Render Environment."
-        )
+        raise RuntimeError("API_KEY_MISSING")
+
     return {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": os.getenv("APP_URL", "https://riganai.onrender.com"),
+        "HTTP-Referer": APP_URL,
         "X-Title": APP_NAME,
     }
+
+
+def safe_api_error(response, service):
+    # Do not send provider response bodies or internal details to visitors.
+    app.logger.warning(
+        "%s returned HTTP %s", service, response.status_code
+    )
+    return f"{service} service error ({response.status_code})."
 
 
 def openrouter_chat(messages, model):
@@ -179,22 +326,17 @@ def openrouter_chat(messages, model):
             "temperature": 0.7,
             "max_tokens": 1800,
         },
-        timeout=120,
+        timeout=CHAT_TIMEOUT,
     )
 
     if not response.ok:
-        try:
-            detail = response.json().get("error", {}).get("message", response.text)
-        except Exception:
-            detail = response.text
-        raise RuntimeError(
-            f"OpenRouter chat error ({response.status_code}): {detail}"
-        )
+        raise RuntimeError(safe_api_error(response, "OpenRouter chat"))
 
     data = response.json()
     choices = data.get("choices") or []
     if not choices:
-        raise RuntimeError("OpenRouter haikurudisha jibu.")
+        raise RuntimeError("AI haikurudisha jibu.")
+
     message = choices[0].get("message") or {}
     content = message.get("content", "")
 
@@ -207,27 +349,43 @@ def openrouter_chat(messages, model):
 
     content = str(content).strip()
     if not content:
-        raise RuntimeError("Jibu la AI lilikuwa tupu.")
+        raise RuntimeError("AI haikurudisha jibu.")
     return content
 
 
-def creator_identity_answer(message):
-    text = (message or "").lower()
-    patterns = (
-        "who created you", "who made you", "who is your creator",
-        "who owns you", "who developed you", "who built you",
-        "nani amekutengeneza", "nani alikutengeneza",
-        "nani alikuumba", "nani mmiliki wako",
-        "nani amekuunda", "umetengenezwa na nani",
-        "uliundwa na nani", "mtengenezaji wako ni nani",
-    )
-    if any(p in text for p in patterns):
-        return (
-            f"Mimi ni {APP_NAME}. Nimetengenezwa na kumilikiwa na "
-            f"{OWNER_NAME}."
-        )
-    return None
+# ------------------------- IMAGE VALIDATION -------------------------
 
+def validate_image(raw, mimetype):
+    if not raw:
+        raise ValueError("Picha haina data.")
+
+    if len(raw) > MAX_IMAGE_SIZE:
+        raise ValueError("Picha iwe chini ya 6 MB.")
+
+    signatures = {
+        "image/jpeg": lambda b: b.startswith(b"\xff\xd8\xff"),
+        "image/png": lambda b: b.startswith(b"\x89PNG\r\n\x1a\n"),
+        "image/webp": lambda b: (
+            len(b) >= 12 and b[:4] == b"RIFF" and b[8:12] == b"WEBP"
+        ),
+    }
+
+    checker = signatures.get(mimetype)
+    if not checker or not checker(raw):
+        raise ValueError(
+            "Aina halisi ya picha haijathibitishwa. Tumia JPG, PNG au WEBP."
+        )
+
+    if mimetype == "image/jpeg" and not raw.endswith(b"\xff\xd9"):
+        raise ValueError("Picha ya JPG haijakamilika.")
+
+    if mimetype == "image/png" and b"IEND" not in raw[-16:]:
+        raise ValueError("Picha ya PNG haijakamilika.")
+
+    return True
+
+
+# ------------------------- HTML INTERFACE -------------------------
 
 PAGE = r"""
 <!DOCTYPE html>
@@ -290,7 +448,7 @@ Andika ujumbe wako au tumia vitufe hapa chini.
 <input id="message" type="text" placeholder="Sema au andika ujumbe..." autocomplete="off">
 <button id="send" type="button">TUMA</button>
 </div>
-<input id="file" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+<input id="file" type="file" accept="image/jpeg,image/png,image/webp" hidden>
 <div class="small">RIGAN AI ULTIMATE</div>
 </section>
 
@@ -299,11 +457,22 @@ const chat=document.getElementById('chat');
 const input=document.getElementById('message');
 const statusEl=document.getElementById('status');
 const fileInput=document.getElementById('file');
-const conversationId=localStorage.getItem('rigan_v16_conversation')||crypto.randomUUID();
-localStorage.setItem('rigan_v16_conversation',conversationId);
-let voiceOn=true,selectedImage=null,busy=false;
+
+let conversationId=null;
+let csrfToken=null;
+let voiceOn=true;
+let selectedImage=null;
+let busy=false;
 
 function status(t){statusEl.textContent=t||'';}
+
+async function initializeSession(){
+ const res=await fetch('/api/session',{credentials:'same-origin'});
+ if(!res.ok)throw new Error('Session initialization failed');
+ const data=await res.json();
+ conversationId=data.conversation_id;
+ csrfToken=data.csrf_token;
+}
 
 function addBubble(text,who='bot',imageUrl=null){
  const box=document.createElement('div');
@@ -317,54 +486,98 @@ function addBubble(text,who='bot',imageUrl=null){
  box.appendChild(body);
  if(imageUrl){
   const img=document.createElement('img');
-  img.src=imageUrl;img.alt='Picha';box.appendChild(img);
+  img.src=imageUrl;
+  img.alt='Picha';
+  box.appendChild(img);
  }
- chat.appendChild(box);chat.scrollTop=chat.scrollHeight;return box;
+ chat.appendChild(box);
+ chat.scrollTop=chat.scrollHeight;
+ return box;
 }
 
 function speak(text){
  if(!voiceOn||!('speechSynthesis' in window))return;
  speechSynthesis.cancel();
  const u=new SpeechSynthesisUtterance(text);
- u.lang='sw-KE';u.rate=1;speechSynthesis.speak(u);
+ u.lang='sw-KE';
+ u.rate=1;
+ speechSynthesis.speak(u);
 }
 
 async function send(){
  const text=input.value.trim();
  if(busy||(!text&&!selectedImage))return;
+ if(!conversationId||!csrfToken){
+  status('Inaandaa session...');
+  return;
+ }
+
  if(!selectedImage&&/^(tengeneza picha|generate image|draw image)\s+/i.test(text)){
   input.value='';
   const prompt=text.replace(/^(tengeneza picha|generate image|draw image)\s+(ya\s+)?/i,'');
-  await generateImage(prompt);return;
+  await generateImage(prompt);
+  return;
  }
- busy=true;document.getElementById('send').disabled=true;
+
+ busy=true;
+ document.getElementById('send').disabled=true;
  const localImage=selectedImage?URL.createObjectURL(selectedImage):null;
  addBubble(text||'Tafadhali chambua picha hii.','user',localImage);
+
  const form=new FormData();
  form.append('message',text);
- form.append('conversation_id',conversationId);
  if(selectedImage)form.append('image',selectedImage);
- input.value='';selectedImage=null;fileInput.value='';
+
+ input.value='';
+ selectedImage=null;
+ fileInput.value='';
  status('RIGAN AI inafikiri...');
+
  try{
-  const res=await fetch('/api/chat',{method:'POST',body:form});
+  const res=await fetch('/api/chat',{
+   method:'POST',
+   credentials:'same-origin',
+   headers:{'X-CSRF-Token':csrfToken},
+   body:form
+  });
   const data=await res.json();
   if(!res.ok)throw new Error(data.error||'Hitilafu imetokea');
-  addBubble(data.reply);speak(data.reply);status('');
+  addBubble(data.reply);
+  speak(data.reply);
+  status('');
  }catch(e){
-  addBubble('Samahani: '+e.message);status('Angalia API key, model au Render Logs.');
+  addBubble('Samahani: '+e.message);
+  status('Angalia muunganisho au Render Logs.');
  }finally{
   if(localImage)URL.revokeObjectURL(localImage);
-  busy=false;document.getElementById('send').disabled=false;input.focus();
+  busy=false;
+  document.getElementById('send').disabled=false;
+  input.focus();
  }
 }
 
 document.getElementById('send').addEventListener('click',send);
 input.addEventListener('keydown',e=>{if(e.key==='Enter')send();});
 document.getElementById('picture').onclick=()=>fileInput.click();
+
 fileInput.onchange=()=>{
- selectedImage=fileInput.files[0]||null;
- if(selectedImage)status('Picha imechaguliwa. Andika swali kisha bonyeza TUMA.');
+ const file=fileInput.files[0]||null;
+ if(!file){selectedImage=null;return;}
+ const allowed=['image/jpeg','image/png','image/webp'];
+ if(!allowed.includes(file.type)){
+  status('Tumia JPG, PNG au WEBP.');
+  fileInput.value='';
+  selectedImage=null;
+  return;
+ }
+ if(file.size>6*1024*1024){
+  status('Picha iwe chini ya 6 MB.');
+  fileInput.value='';
+  selectedImage=null;
+  return;
+ }
+ selectedImage=file;
+ status('Picha imechaguliwa. Andika swali kisha bonyeza TUMA.');
 };
 
 document.getElementById('voice').onclick=()=>{
@@ -377,39 +590,99 @@ document.getElementById('voice').onclick=()=>{
 document.getElementById('listen').onclick=()=>{
  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
  if(!SR){status('Browser hii haitumii speech recognition. Jaribu Chrome.');return;}
- const rec=new SR();rec.lang='sw-KE';rec.interimResults=false;
+ const rec=new SR();
+ rec.lang='sw-KE';
+ rec.interimResults=false;
  status('Ninasikiliza... Ruhusu microphone.');
- rec.onresult=e=>{input.value=e.results[0][0].transcript;status('Sauti imegeuzwa kuwa maandishi. Bonyeza TUMA.');};
+ rec.onresult=e=>{
+  input.value=e.results[0][0].transcript;
+  status('Sauti imegeuzwa kuwa maandishi. Bonyeza TUMA.');
+ };
  rec.onerror=e=>status('Tatizo la microphone: '+e.error);
- rec.onend=()=>{if(statusEl.textContent==='Ninasikiliza... Ruhusu microphone.')status('');};
+ rec.onend=()=>{
+  if(statusEl.textContent==='Ninasikiliza... Ruhusu microphone.')status('');
+ };
  rec.start();
 };
 
 async function generateImage(prompt){
  if(!prompt.trim()||busy)return;
- busy=true;document.getElementById('send').disabled=true;
- addBubble(prompt,'user');status('RIGAN AI inatengeneza picha...');
+ if(!conversationId||!csrfToken){status('Session haijakamilika.');return;}
+ busy=true;
+ document.getElementById('send').disabled=true;
+ addBubble(prompt,'user');
+ status('RIGAN AI inatengeneza picha...');
  try{
   const res=await fetch('/api/generate-image',{
-   method:'POST',headers:{'Content-Type':'application/json'},
+   method:'POST',
+   credentials:'same-origin',
+   headers:{
+    'Content-Type':'application/json',
+    'X-CSRF-Token':csrfToken
+   },
    body:JSON.stringify({prompt})
   });
   const data=await res.json();
   if(!res.ok)throw new Error(data.error||'Image generation failed');
   addBubble(data.message||'Picha imetengenezwa.','bot',data.image||null);
   status(data.image?'Picha imetengenezwa.':'Model imerudisha jibu bila picha.');
- }catch(e){addBubble('Imeshindikana kutengeneza picha: '+e.message);status('');}
- finally{busy=false;document.getElementById('send').disabled=false;}
+ }catch(e){
+  addBubble('Imeshindikana kutengeneza picha: '+e.message);
+  status('');
+ }finally{
+  busy=false;
+  document.getElementById('send').disabled=false;
+ }
 }
+
+initializeSession().then(()=>status('')).catch(()=>{
+ status('Imeshindikana kuanzisha session. Refresh ukurasa.');
+});
 </script>
 </body>
 </html>
 """
 
 
+# ------------------------- SECURITY HEADERS -------------------------
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = (
+        "camera=(), geolocation=(), payment=()"
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob: https:; "
+        "connect-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none';"
+    )
+    return response
+
+
+# ------------------------- ROUTES -------------------------
+
 @app.route("/", methods=["GET"])
 def home():
     return render_template_string(PAGE)
+
+
+@app.route("/api/session", methods=["GET"])
+@rate_limit("session")
+def create_session():
+    conversation_id, csrf_token = ensure_session()
+    return jsonify(
+        conversation_id=conversation_id,
+        csrf_token=csrf_token
+    )
 
 
 @app.route("/health", methods=["GET"])
@@ -417,26 +690,35 @@ def health():
     return jsonify({
         "status": "ok",
         "app": APP_NAME,
-        "database": "postgresql" if DATABASE_URL and psycopg2 else "sqlite",
+        "database": (
+            "postgresql" if DATABASE_URL and psycopg2 else "sqlite"
+        ),
         "api_key_configured": bool(OPENROUTER_API_KEY),
+        "security": "enabled",
     })
 
 
 @app.route("/api/chat", methods=["POST"])
+@rate_limit("chat")
+@require_csrf
 def chat():
     try:
-        message = (request.form.get("message") or "").strip()
-        conversation_id = (request.form.get("conversation_id") or "").strip()
+        conversation_id = session.get("conversation_id")
+        if not conversation_id:
+            return jsonify(error="Session haipo. Refresh ukurasa."), 403
 
-        if not conversation_id or len(conversation_id) > 100:
-            return jsonify(error="conversation_id si sahihi."), 400
+        message = (request.form.get("message") or "").strip()
+        if len(message) > MAX_MESSAGE_LENGTH:
+            return jsonify(error="Ujumbe ni mrefu sana."), 400
 
         image = request.files.get("image")
         if not message and not image:
             return jsonify(error="Andika ujumbe au chagua picha."), 400
 
         user_content = message or "Tafadhali eleza picha hii."
-        identity_reply = creator_identity_answer(message) if not image else None
+        identity_reply = (
+            creator_identity_answer(message) if not image else None
+        )
 
         if identity_reply:
             save_message(conversation_id, "user", user_content)
@@ -446,16 +728,23 @@ def chat():
         history = get_history(conversation_id)
 
         if image:
-            if image.mimetype not in ("image/jpeg", "image/png", "image/webp"):
-                return jsonify(error="Tumia picha ya JPG, PNG au WEBP."), 400
-            raw = image.read()
-            if len(raw) > 6 * 1024 * 1024:
-                return jsonify(error="Picha iwe chini ya 6 MB."), 400
-            encoded = base64.b64encode(raw).decode("utf-8")
+            if image.mimetype not in (
+                "image/jpeg", "image/png", "image/webp"
+            ):
+                return jsonify(error="Tumia JPG, PNG au WEBP."), 400
+
+            raw = image.read(MAX_IMAGE_SIZE + 1)
+            validate_image(raw, image.mimetype)
+
+            encoded = base64.b64encode(raw).decode("ascii")
             data_url = f"data:{image.mimetype};base64,{encoded}"
+
             content = [
                 {"type": "text", "text": user_content},
-                {"type": "image_url", "image_url": {"url": data_url}},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": data_url}
+                },
             ]
             model = VISION_MODEL
         else:
@@ -467,28 +756,51 @@ def chat():
         messages.append({"role": "user", "content": content})
 
         reply = openrouter_chat(messages, model)
+
         save_message(
             conversation_id,
             "user",
             user_content + (" [picha ilitumwa]" if image else "")
         )
         save_message(conversation_id, "assistant", reply)
+
         return jsonify(reply=reply)
 
-    except Exception as exc:
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+    except requests.RequestException:
+        app.logger.exception("Chat network error")
+        return jsonify(
+            error="Huduma ya AI haipatikani kwa sasa. Jaribu tena."
+        ), 502
+
+    except Exception:
         app.logger.exception("Chat endpoint failed")
-        return jsonify(error=str(exc)[:700]), 500
+        return jsonify(
+            error="Hitilafu ya ndani imetokea. Jaribu tena."
+        ), 500
 
 
 @app.route("/api/generate-image", methods=["POST"])
+@rate_limit("image")
+@require_csrf
 def generate_image():
     try:
-        payload = request.get_json(silent=True) or {}
-        prompt = (payload.get("prompt") or "").strip()
+        if not session.get("conversation_id"):
+            return jsonify(error="Session haipo."), 403
 
+        payload = request.get_json(silent=True) or {}
+        prompt = payload.get("prompt")
+
+        if not isinstance(prompt, str):
+            return jsonify(error="Prompt si sahihi."), 400
+
+        prompt = prompt.strip()
         if not prompt:
-            return jsonify(error="Andika maelezo ya picha unayotaka."), 400
-        if len(prompt) > 1500:
+            return jsonify(error="Andika maelezo ya picha."), 400
+
+        if len(prompt) > MAX_IMAGE_PROMPT:
             return jsonify(error="Maelezo ya picha ni marefu sana."), 400
 
         response = requests.post(
@@ -499,66 +811,101 @@ def generate_image():
                 "prompt": prompt,
                 "size": "1024x1024",
             },
-            timeout=180,
+            timeout=IMAGE_TIMEOUT,
         )
 
         if not response.ok:
-            try:
-                error_data = response.json().get("error", {})
-                detail = error_data.get("message", response.text)
-            except Exception:
-                detail = response.text
             raise RuntimeError(
-                f"OpenRouter image error ({response.status_code}): {detail}"
+                safe_api_error(response, "OpenRouter image")
             )
 
         data = response.json()
         items = data.get("data") or []
         item = items[0] if items else {}
-        b64 = item.get("b64_json")
 
+        b64 = item.get("b64_json")
         if b64:
-            image_url = "data:image/png;base64," + b64
-            return jsonify(message="Picha imetengenezwa.", image=image_url)
+            try:
+                decoded = base64.b64decode(b64, validate=True)
+            except Exception:
+                raise RuntimeError("Image response is invalid.")
+
+            if len(decoded) > 7 * 1024 * 1024:
+                raise RuntimeError("Generated image is too large.")
+
+            if not decoded.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise RuntimeError("Generated image format is invalid.")
+
+            return jsonify(
+                message="Picha imetengenezwa.",
+                image="data:image/png;base64," + b64
+            )
 
         image_url = item.get("url")
         if image_url:
-            return jsonify(message="Picha imetengenezwa.", image=image_url)
+            parsed = urlparse(image_url)
+            if parsed.scheme != "https" or not parsed.hostname:
+                raise RuntimeError("Image URL is invalid.")
+            return jsonify(
+                message="Picha imetengenezwa.",
+                image=image_url
+            )
 
-        # Some image-capable endpoints may return an image in a different shape.
         choices = data.get("choices") or []
         if choices:
             msg = choices[0].get("message") or {}
             images = msg.get("images") or []
-            if images:
-                first = images[0]
-                if isinstance(first, dict):
-                    image_url = first.get("image_url", {}).get("url")
-                    if image_url:
-                        return jsonify(message="Picha imetengenezwa.", image=image_url)
+            if images and isinstance(images[0], dict):
+                image_url = (
+                    images[0].get("image_url", {}).get("url")
+                )
+                if image_url:
+                    return jsonify(
+                        message="Picha imetengenezwa.",
+                        image=image_url
+                    )
 
         raise RuntimeError(
-            "Model haikurudisha picha inayoweza kuonyeshwa. "
-            "Thibitisha IMAGE_MODEL na uwezo wa image generation wa model hiyo."
+            "Model haikurudisha picha inayoweza kuonyeshwa."
         )
 
-    except Exception as exc:
+    except requests.RequestException:
+        app.logger.exception("Image network error")
+        return jsonify(
+            error="Huduma ya picha haipatikani kwa sasa."
+        ), 502
+
+    except RuntimeError as exc:
+        app.logger.warning("Image service error: %s", str(exc))
+        return jsonify(
+            error="Image generation imeshindwa. "
+                  "Angalia model au API configuration."
+        ), 502
+
+    except Exception:
         app.logger.exception("Image generation failed")
-        return jsonify(error=str(exc)[:700]), 500
+        return jsonify(
+            error="Hitilafu imetokea wakati wa kutengeneza picha."
+        ), 500
 
 
 @app.errorhandler(413)
 def file_too_large(_error):
-    return jsonify(error="Faili ni kubwa mno. Tumia picha chini ya 6 MB."), 413
+    return jsonify(
+        error="Faili ni kubwa mno. Tumia picha chini ya 6 MB."
+    ), 413
 
 
-# Initialize database when the application starts.
+# ------------------------- STARTUP -------------------------
+
 try:
     init_db()
+    app.logger.info("%s database initialized.", APP_NAME)
 except Exception:
     app.logger.exception("Database initialization failed")
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
+            
